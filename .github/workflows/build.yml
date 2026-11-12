@@ -1,0 +1,49 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FUSE
+        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse2t64
+      - name: Build
+        run: make -j4
+      - name: Test (unit, toolkit, FUSE mounts)
+        run: sudo make test
+      - name: Test under ASan/UBSan
+        run: |
+          make BUILD=build/asan OPT="-O1 -g -fsanitize=address,undefined" \
+               LDFLAGS="-fsanitize=address,undefined" build/asan/bin/jfs-unit-tests
+          mkdir -p /tmp/u && build/asan/bin/jfs-unit-tests /tmp/u
+
+  test-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run unit + toolkit tests
+        run: |
+          make -j4 build/native/bin/jsonfs build/native/bin/jsonfs-mount build/native/bin/jfs-unit-tests
+          mkdir -p /tmp/u && build/native/bin/jfs-unit-tests /tmp/u
+          sh tests/toolkit_test.sh "$PWD/build/native/bin/jsonfs"
+
+  release:
+    runs-on: ubuntu-24.04
+    needs: [test-linux]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchains
+        run: |
+          sudo apt-get update && sudo apt-get install -y mingw-w64 nsis zip
+          scripts/fetch-deps.sh all
+      - name: Build all targets and installers
+        run: scripts/build-release.sh all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jsonfs-release
+          path: dist/*
