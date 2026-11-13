@@ -5,6 +5,7 @@
 set -u
 J=${1:-build/native/bin/jsonfs}
 M=${2:-build/native/bin/jsonfs-mount}
+HERE=$(cd "$(dirname "$0")" && pwd)
 T=$(mktemp -d "${TMPDIR:-/tmp}/jsonfs-mt.XXXXXX")
 pass=0
 fail=0
@@ -98,6 +99,25 @@ check "fifo type" test -p mnt/fifo
 check "df" df mnt
 cp -r "$(dirname "$0")" mnt/tree 2>/dev/null || cp -r /etc/ssl mnt/tree 2>/dev/null || true
 check "statfs/du" du -s mnt
+
+# file system events through the mount (inotify on Linux)
+if [ "$(uname -s)" = Linux ] && command -v python3 >/dev/null 2>&1; then
+    mkdir -p mnt/watch
+    python3 "$HERE/inotify_watch.py" ev.txt 2 mnt/watch &
+    i=0
+    while [ ! -f ev.txt.ready ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    echo hi >mnt/watch/f
+    echo more >>mnt/watch/f
+    chmod 600 mnt/watch/f
+    mv mnt/watch/f mnt/watch/g
+    mkdir mnt/watch/sub
+    rm mnt/watch/g
+    sleep 2.3
+    for ev in "CREATE mnt/watch/f" "MODIFY mnt/watch/f" "ATTRIB mnt/watch/f" "MOVED_FROM mnt/watch/f" \
+        "MOVED_TO mnt/watch/g" "CREATE mnt/watch/sub" "DELETE mnt/watch/g"; do
+        check "inotify: $ev" grep -q "$ev" ev.txt
+    done
+fi
 
 # exclusive attach is enforced
 check_fails "second exclusive mount refused" env JSONFS_LOCK_TIMEOUT=0.3 "$M" img.json mnt2

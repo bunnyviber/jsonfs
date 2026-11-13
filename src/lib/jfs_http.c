@@ -92,6 +92,10 @@ static int status_error(long code)
 
 /* libcurl ABI (stable since 7.x): option numbers from curl/curl.h */
 #define C_OPT_WRITEDATA 10001
+#define C_OPT_RANGE 10007
+#define C_OPT_HTTPHEADER 10023
+#define C_OPT_HEADERDATA 10029
+#define C_OPT_HEADERFUNCTION 20079
 #define C_OPT_URL 10002
 #define C_OPT_ERRORBUFFER 10010
 #define C_OPT_USERAGENT 10018
@@ -138,6 +142,8 @@ static struct {
     int (*easy_getinfo)(CURL *, int, ...);
     const char *(*easy_strerror)(int);
     void (*easy_cleanup)(CURL *);
+    void *(*slist_append)(void *, const char *);
+    void (*slist_free_all)(void *);
 } cu;
 static jfs_mutex cu_mu;
 static int cu_mu_init;
@@ -192,6 +198,8 @@ static int curl_load(char *why, size_t whylen)
     SYM(easy_getinfo, "curl_easy_getinfo");
     SYM(easy_strerror, "curl_easy_strerror");
     SYM(easy_cleanup, "curl_easy_cleanup");
+    SYM(slist_append, "curl_slist_append");
+    SYM(slist_free_all, "curl_slist_free_all");
 #undef SYM
     if (cu.global_init(C_GLOBAL_DEFAULT) != 0) {
         snprintf(why, whylen, "curl_global_init failed");
@@ -204,12 +212,20 @@ static int curl_load(char *why, size_t whylen)
 typedef struct sink {
     jfs_buf buf;
     int too_big;
+    size_t limit;
+    int limit_hit;
+    jfs_http_resp *resp;
 } sink;
 
 static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *ud)
 {
     sink *s = ud;
     size_t n = size * nmemb;
+    if (s->limit && s->buf.len + n >= s->limit) {
+        jfs_buf_append(&s->buf, ptr, s->limit - s->buf.len);
+        s->limit_hit = 1;
+        return 0; /* stop the transfer: we have what we asked for */
+    }
     if (s->buf.len + n < s->buf.len || s->buf.len + n > (((size_t)-1) >> 2)) {
         s->too_big = 1;
         return 0; /* aborts the transfer */
@@ -218,8 +234,62 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *ud)
     return n;
 }
 
+static void header_value(const char *line, size_t n, char *out, size_t outlen)
+{
+    const char *v = memchr(line, ':', n), *e = line + n;
+    size_t l;
+    if (!v)
+        return;
+    v++;
+    while (v < e && (*v == ' ' || *v == '\t'))
+        v++;
+    while (e > v && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' '))
+        e--;
+    l = (size_t)(e - v);
+    if (l >= outlen)
+        l = outlen - 1;
+    memcpy(out, v, l);
+    out[l] = 0;
+}
+
+static int header_is(const char *line, size_t n, const char *name)
+{
+    size_t k = strlen(name), i;
+    if (n <= k || line[k] != ':')
+        return 0;
+    for (i = 0; i < k; i++)
+        if (tolower((unsigned char)line[i]) != name[i])
+            return 0;
+    return 1;
+}
+
+static size_t header_cb(char *line, size_t size, size_t nmemb, void *ud)
+{
+    sink *s = ud;
+    size_t n = size * nmemb;
+    if (n >= 5 && !memcmp(line, "HTTP/", 5)) { /* new response (redirects): reset */
+        s->resp->etag[0] = 0;
+        s->resp->last_modified[0] = 0;
+    } else if (header_is(line, n, "etag")) {
+        header_value(line, n, s->resp->etag, sizeof s->resp->etag);
+    } else if (header_is(line, n, "last-modified")) {
+        header_value(line, n, s->resp->last_modified, sizeof s->resp->last_modified);
+    }
+    return n;
+}
+
 int jfs_http_get(const char *url, char **data, size_t *len, char *err, size_t errlen)
 {
+    return jfs_http_fetch(url, NULL, NULL, data, len, err, errlen);
+}
+
+int jfs_http_fetch(const char *url, const jfs_http_req *req, jfs_http_resp *resp, char **data, size_t *len,
+                   char *err, size_t errlen)
+{
+    void *hdrs = NULL;
+    jfs_http_resp dummy_resp;
+    jfs_http_req dummy_req;
+    char range[64];
     CURL *c;
     sink s;
     char ebuf[C_ERROR_SIZE], shown[1024];
@@ -246,9 +316,36 @@ int jfs_http_get(const char *url, char **data, size_t *len, char *err, size_t er
         snprintf(err, errlen, "curl_easy_init failed");
         return -JFS_ENOMEM;
     }
+    if (!req) {
+        memset(&dummy_req, 0, sizeof dummy_req);
+        req = &dummy_req;
+    }
+    if (!resp)
+        resp = &dummy_resp;
+    memset(resp, 0, sizeof *resp);
     memset(&s, 0, sizeof s);
     jfs_buf_init(&s.buf);
+    s.limit = req->max_bytes;
+    s.resp = resp;
     ebuf[0] = 0;
+    cu.easy_setopt(c, C_OPT_HEADERFUNCTION, header_cb);
+    cu.easy_setopt(c, C_OPT_HEADERDATA, &s);
+    if (req->if_none_match && *req->if_none_match) {
+        char *h = jfs_asprintf("If-None-Match: %s", req->if_none_match);
+        hdrs = cu.slist_append(hdrs, h);
+        free(h);
+    }
+    if (req->if_modified_since && *req->if_modified_since) {
+        char *h = jfs_asprintf("If-Modified-Since: %s", req->if_modified_since);
+        hdrs = cu.slist_append(hdrs, h);
+        free(h);
+    }
+    if (hdrs)
+        cu.easy_setopt(c, C_OPT_HTTPHEADER, hdrs);
+    if (req->range_end) {
+        snprintf(range, sizeof range, "0-%llu", (unsigned long long)req->range_end);
+        cu.easy_setopt(c, C_OPT_RANGE, range);
+    }
     cu.easy_setopt(c, C_OPT_URL, url);
     cu.easy_setopt(c, C_OPT_ERRORBUFFER, ebuf);
     cu.easy_setopt(c, C_OPT_WRITEFUNCTION, write_cb);
@@ -258,7 +355,8 @@ int jfs_http_get(const char *url, char **data, size_t *len, char *err, size_t er
     cu.easy_setopt(c, C_OPT_CONNECTTIMEOUT, 30L);
     cu.easy_setopt(c, C_OPT_LOW_SPEED_LIMIT, 1L);
     cu.easy_setopt(c, C_OPT_LOW_SPEED_TIME, 60L);
-    cu.easy_setopt(c, C_OPT_ACCEPT_ENCODING, ""); /* gzip/deflate/br as supported */
+    if (!req->range_end)
+        cu.easy_setopt(c, C_OPT_ACCEPT_ENCODING, ""); /* gzip/deflate/br as supported */
     /* only http/https; redirects only for https and only to https */
     if (cu.easy_setopt(c, C_OPT_PROTOCOLS_STR, "http,https") == C_E_UNKNOWN_OPTION)
         cu.easy_setopt(c, C_OPT_PROTOCOLS, C_PROTO_HTTP | C_PROTO_HTTPS);
@@ -281,7 +379,14 @@ int jfs_http_get(const char *url, char **data, size_t *len, char *err, size_t er
     }
     rc = cu.easy_perform(c);
     cu.easy_getinfo(c, C_INFO_RESPONSE_CODE, &code);
-    if (rc != C_E_OK) {
+    resp->status = code;
+    if (rc == C_E_WRITE_ERROR && s.limit_hit) {
+        rc = C_E_OK;
+        resp->truncated = 1;
+    }
+    if (rc == C_E_OK && code == 304) {
+        resp->not_modified = 1;
+    } else if (rc != C_E_OK) {
         const char *detail = ebuf[0] ? ebuf : cu.easy_strerror(rc);
         switch (rc) {
         case C_E_PEER_FAILED_VERIFICATION:
@@ -316,11 +421,13 @@ int jfs_http_get(const char *url, char **data, size_t *len, char *err, size_t er
         snprintf(err, errlen, "%s: HTTP %ld redirect to %s is not followed for %s URLs; use the final URL", shown,
                  code, loc ? loc : "(unknown)", https ? "https:// -> http://" : "http://");
         ret = -JFS_EREMOTE;
-    } else if (code != 200) {
+    } else if (code != 200 && !(code == 206 && req->range_end)) {
         snprintf(err, errlen, "%s: HTTP status %ld", shown, code);
         ret = status_error(code);
     }
     cu.easy_cleanup(c);
+    if (hdrs)
+        cu.slist_free_all(hdrs);
     if (ret) {
         jfs_buf_free(&s.buf);
         return ret;
@@ -368,6 +475,28 @@ static void win_msg(DWORD e, char *buf, size_t n)
 
 int jfs_http_get(const char *url, char **data, size_t *len, char *err, size_t errlen)
 {
+    return jfs_http_fetch(url, NULL, NULL, data, len, err, errlen);
+}
+
+static void query_str(HINTERNET req, DWORD what, char *out, size_t outlen)
+{
+    wchar_t w[512];
+    DWORD sz = sizeof w;
+    out[0] = 0;
+    if (WinHttpQueryHeaders(req, what, WINHTTP_HEADER_NAME_BY_INDEX, w, &sz, WINHTTP_NO_HEADER_INDEX)) {
+        char *u = jfs_wide_to_utf8(w);
+        snprintf(out, outlen, "%s", u);
+        free(u);
+    }
+}
+
+int jfs_http_fetch(const char *url, const jfs_http_req *rq, jfs_http_resp *resp, char **data, size_t *len,
+                   char *err, size_t errlen)
+{
+    jfs_http_req dummy_req;
+    jfs_http_resp dummy_resp;
+    jfs_buf hb;
+    wchar_t *whdrs = NULL;
     wchar_t *wurl = jfs_utf8_to_wide(url);
     wchar_t host[256], user[256], pass[256];
     wchar_t *path;
@@ -383,9 +512,27 @@ int jfs_http_get(const char *url, char **data, size_t *len, char *err, size_t er
     }
     jfs_url_redact(url, shown, sizeof shown);
     jfs_buf_init(&buf);
+    if (!rq) {
+        memset(&dummy_req, 0, sizeof dummy_req);
+        rq = &dummy_req;
+    }
+    if (!resp)
+        resp = &dummy_resp;
+    memset(resp, 0, sizeof *resp);
+    jfs_buf_init(&hb);
+    if (rq->if_none_match && *rq->if_none_match)
+        jfs_buf_printf(&hb, "If-None-Match: %s\r\n", rq->if_none_match);
+    if (rq->if_modified_since && *rq->if_modified_since)
+        jfs_buf_printf(&hb, "If-Modified-Since: %s\r\n", rq->if_modified_since);
+    if (rq->range_end)
+        jfs_buf_printf(&hb, "Range: bytes=0-%llu\r\n", (unsigned long long)rq->range_end);
+    if (hb.len)
+        whdrs = jfs_utf8_to_wide(hb.data);
+    jfs_buf_free(&hb);
     if (g_cafile) {
         snprintf(err, errlen, "--cacert is not supported on Windows; import the CA into the Windows certificate store");
         free(wurl);
+        free(whdrs);
         return -JFS_ENOTSUP;
     }
     memset(&uc, 0, sizeof uc);
@@ -401,6 +548,7 @@ int jfs_http_get(const char *url, char **data, size_t *len, char *err, size_t er
     if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) {
         snprintf(err, errlen, "%s: invalid URL", shown);
         free(wurl);
+        free(whdrs);
         return -JFS_EINVAL;
     }
     /* path + query (both point into wurl) */
@@ -447,11 +595,19 @@ int jfs_http_get(const char *url, char **data, size_t *len, char *err, size_t er
     if (uc.dwUserNameLength)
         WinHttpSetCredentials(req, WINHTTP_AUTH_TARGET_SERVER, WINHTTP_AUTH_SCHEME_BASIC, user,
                               uc.dwPasswordLength ? pass : L"", NULL);
-    if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+    if (!WinHttpSendRequest(req, whdrs ? whdrs : WINHTTP_NO_ADDITIONAL_HEADERS, whdrs ? (DWORD)-1L : 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(req, NULL))
         goto werr;
     WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
                         &status, &sz, WINHTTP_NO_HEADER_INDEX);
+    resp->status = (long)status;
+    query_str(req, WINHTTP_QUERY_ETAG, resp->etag, sizeof resp->etag);
+    query_str(req, WINHTTP_QUERY_LAST_MODIFIED, resp->last_modified, sizeof resp->last_modified);
+    if (status == 304) {
+        resp->not_modified = 1;
+        goto out;
+    }
     if (status >= 300 && status < 400) {
         wchar_t loc[2048];
         DWORD ls = sizeof loc;
@@ -465,7 +621,7 @@ int jfs_http_get(const char *url, char **data, size_t *len, char *err, size_t er
         ret = -JFS_EREMOTE;
         goto out;
     }
-    if (status != 200) {
+    if (status != 200 && !(status == 206 && rq->range_end)) {
         snprintf(err, errlen, "%s: HTTP status %lu", shown, (unsigned long)status);
         ret = status_error((long)status);
         goto out;
@@ -476,6 +632,10 @@ int jfs_http_get(const char *url, char **data, size_t *len, char *err, size_t er
             goto werr;
         if (!avail)
             break;
+        if (rq->max_bytes && buf.len + avail >= rq->max_bytes) {
+            avail = (DWORD)(rq->max_bytes - buf.len);
+            resp->truncated = 1;
+        }
         if (buf.len + avail > (((size_t)-1) >> 2)) {
             snprintf(err, errlen, "%s: image too large", shown);
             ret = -JFS_EFBIG;
@@ -486,6 +646,8 @@ int jfs_http_get(const char *url, char **data, size_t *len, char *err, size_t er
             goto werr;
         buf.len += got;
         buf.data[buf.len] = 0;
+        if (resp->truncated)
+            break;
     }
     goto out;
 werr:
@@ -510,6 +672,7 @@ out:
         WinHttpCloseHandle(ses);
     free(path);
     free(wurl);
+    free(whdrs);
     if (ret) {
         jfs_buf_free(&buf);
         return ret;

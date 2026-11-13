@@ -696,10 +696,12 @@ int jfs_dokan_run(void)
     opt.MountPoint = mount_point_w;
 
     jfs_start_committer(jfs_mount_fs);
+    jfs_refresh_start(); /* web images: refresh (Dokan 0.6 cannot report change events) */
     SetConsoleCtrlHandler(ctrl_handler, TRUE);
     fprintf(stderr, "jsonfs: mounting %s on %s via Dokan (Ctrl+C to unmount)\n", jfs_mount_cfg.image,
             jfs_mount_cfg.mountpoint);
     rc = pDokanMain(&opt, &ops);
+    jfs_refresh_stop();
     jfs_close(jfs_mount_fs);
     jfs_mount_fs = NULL;
     switch (rc) {

@@ -28,7 +28,7 @@ static int op_enter(jfs_fs *fs, int kind)
         jfs_mutex_unlock(&fs->mu);
         return -JFS_EROFS;
     }
-    if (fs->shared && fs->lock) {
+    if (fs->shared && fs->lock && !fs->replay_target) {
         int rc;
         jfs_lockfile_lock(fs->lock, JFS_LOCK_TXN, kind == OP_META, 1);
         rc = jfs_maybe_reload(fs);
@@ -1132,4 +1132,179 @@ int jfs_removexattr(jfs_fs *fs, const char *path, const char *name)
     *x = in->xattrs[--in->nxattrs];
     in->ctime = jfs_now();
     LEAVE(OP_META, 0);
+}
+
+/* ======================================================================== */
+/* Replay of remote changes (see jfs_replay_begin in jfs_fs.h)                */
+/* These run for system calls the mount driver issues on its own mount point; */
+/* they copy state from the pending version and never version, dirty or       */
+/* commit anything: jfs_pending_install() makes the state exact afterwards.  */
+/* ======================================================================== */
+static void replay_unbind(jfs_fs *fs, jfs_inode *dir, const char *name, jfs_inode *child)
+{
+    jfs_strmap_del(dir->entries, name);
+    if (child->type == JFS_T_DIR) {
+        if (dir->nlink > 2)
+            dir->nlink--;
+    } else if (child->nlink) {
+        child->nlink--;
+    }
+    if (child->type == JFS_T_DIR || child->nlink == 0) {
+        jfs_u64map_del(&fs->inodes, child->ino);
+        if (child->open_count > 0) {
+            child->persisted = 0;
+            jfs_orphan_add(fs, child);
+        } else {
+            jfs_inode_free(child);
+        }
+    }
+}
+
+int jfs_replay_create(jfs_fs *fs, const char *path)
+{
+    jfs_inode *dir, *t, *existing, *c;
+    char name[JFS_NAME_MAX + 1];
+    int rc;
+    jfs_mutex_lock(&fs->mu);
+    if (!fs->replay_target) {
+        rc = -JFS_EROFS;
+        goto out;
+    }
+    rc = jfs_resolve(fs->replay_target, path, &t);
+    if (!rc)
+        rc = resolve_parent(fs, path, &dir, name);
+    if (rc)
+        goto out;
+    if (dir_lookup(fs, dir, name)) {
+        rc = -JFS_EEXIST;
+        goto out;
+    }
+    existing = jfs_u64map_get(&fs->inodes, t->ino);
+    if (existing && !existing->deleted) {
+        if (existing->type == JFS_T_DIR || existing->type != t->type) {
+            rc = -JFS_EEXIST;
+            goto out;
+        }
+        c = existing; /* another name of an existing file */
+    } else {
+        if (existing) {
+            jfs_u64map_del(&fs->inodes, existing->ino);
+            jfs_inode_free(existing);
+        }
+        c = jfs_inode_clone(t);
+        c->nlink = t->type == JFS_T_DIR ? 2 : 0;
+        jfs_u64map_put(&fs->inodes, c->ino, c);
+    }
+    jfs_strmap_put(dir->entries, name, c->ino);
+    if (c->type == JFS_T_DIR)
+        dir->nlink++;
+    else
+        c->nlink++;
+out:
+    jfs_mutex_unlock(&fs->mu);
+    return rc;
+}
+
+int jfs_replay_link(jfs_fs *fs, const char *existing, const char *path)
+{
+    jfs_inode *src, *dir;
+    char name[JFS_NAME_MAX + 1];
+    int rc;
+    jfs_mutex_lock(&fs->mu);
+    rc = fs->replay_target ? jfs_resolve(fs, existing, &src) : -JFS_EROFS;
+    if (!rc && src->type == JFS_T_DIR)
+        rc = -JFS_EPERM;
+    if (!rc)
+        rc = resolve_parent(fs, path, &dir, name);
+    if (!rc && dir_lookup(fs, dir, name))
+        rc = -JFS_EEXIST;
+    if (!rc) {
+        jfs_strmap_put(dir->entries, name, src->ino);
+        src->nlink++;
+    }
+    jfs_mutex_unlock(&fs->mu);
+    return rc;
+}
+
+int jfs_replay_remove(jfs_fs *fs, const char *path)
+{
+    jfs_inode *dir, *c;
+    char name[JFS_NAME_MAX + 1];
+    int rc;
+    jfs_mutex_lock(&fs->mu);
+    rc = fs->replay_target ? resolve_parent(fs, path, &dir, name) : -JFS_EROFS;
+    if (!rc && !(c = dir_lookup(fs, dir, name)))
+        rc = -JFS_ENOENT;
+    if (!rc && c->type == JFS_T_DIR && c->entries->count)
+        rc = -JFS_ENOTEMPTY;
+    if (!rc)
+        replay_unbind(fs, dir, name, c);
+    jfs_mutex_unlock(&fs->mu);
+    return rc;
+}
+
+int jfs_replay_rename(jfs_fs *fs, const char *from, const char *to)
+{
+    jfs_inode *sdir, *ddir, *src, *dst;
+    char sname[JFS_NAME_MAX + 1], dname[JFS_NAME_MAX + 1];
+    int rc;
+    jfs_mutex_lock(&fs->mu);
+    rc = fs->replay_target ? resolve_parent(fs, from, &sdir, sname) : -JFS_EROFS;
+    if (!rc)
+        rc = resolve_parent(fs, to, &ddir, dname);
+    if (!rc && !(src = dir_lookup(fs, sdir, sname)))
+        rc = -JFS_ENOENT;
+    if (rc)
+        goto out;
+    dst = dir_lookup(fs, ddir, dname);
+    if (dst == src)
+        goto out;
+    if (dst) {
+        if (dst->type == JFS_T_DIR && dst->entries->count) {
+            rc = -JFS_ENOTEMPTY;
+            goto out;
+        }
+        replay_unbind(fs, ddir, dname, dst);
+    }
+    jfs_strmap_del(sdir->entries, sname);
+    jfs_strmap_put(ddir->entries, dname, src->ino);
+    if (src->type == JFS_T_DIR && sdir != ddir) {
+        if (sdir->nlink > 2)
+            sdir->nlink--;
+        ddir->nlink++;
+    }
+out:
+    jfs_mutex_unlock(&fs->mu);
+    return rc;
+}
+
+int jfs_replay_update(jfs_fs *fs, const char *path)
+{
+    jfs_inode *t, *c;
+    int rc;
+    jfs_mutex_lock(&fs->mu);
+    rc = fs->replay_target ? jfs_resolve(fs->replay_target, path, &t) : -JFS_EROFS;
+    if (!rc)
+        rc = jfs_resolve(fs, path, &c);
+    if (!rc && c->type != t->type)
+        rc = -JFS_EINVAL;
+    if (!rc)
+        jfs_inode_copy_state(c, t);
+    jfs_mutex_unlock(&fs->mu);
+    return rc;
+}
+
+int jfs_replay_update_handle(jfs_fs *fs, jfs_handle *h)
+{
+    jfs_inode *t;
+    int rc = 0;
+    jfs_mutex_lock(&fs->mu);
+    if (!fs->replay_target)
+        rc = -JFS_EROFS;
+    else if (!(t = jfs_lookup_ino(fs->replay_target, h->ino->ino)) || t->type != h->ino->type)
+        rc = -JFS_ENOENT;
+    else
+        jfs_inode_copy_state(h->ino, t);
+    jfs_mutex_unlock(&fs->mu);
+    return rc;
 }

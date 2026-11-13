@@ -79,6 +79,14 @@ static void usage(FILE *f)
             "  commit=SECONDS       commit interval for single-attach mounts (default 5,\n"
             "                       0 = commit after every change)\n"
             "  insecure, cafile=F   same as --insecure / --cacert F\n"
+            "  refresh=MODE         web images: periodic (default; eventually consistent),\n"
+            "                       strict (check before every open / directory listing)\n"
+            "                       or off\n"
+            "  refresh_interval=S   seconds between background checks (default 60)\n"
+            "  refresh_min=S        strict mode: reuse a check younger than S seconds\n"
+            "  cache=PATH|auto      keep the latest copy on disk; mount from it when the\n"
+            "                       server is unreachable, revalidate it cheaply otherwise\n"
+            "  events=on|off        report remote changes as file system events (inotify...)\n"
             "  backend=winfsp|dokan Windows only: force a kernel interface\n"
             "  volname=NAME         Windows only: volume label shown in Explorer\n"
             "\n"
@@ -141,6 +149,31 @@ static void parse_o(const char *list)
             }
             jfs_mount_cfg.has_at = 1;
             jfs_mount_cfg.readonly = 1;
+        } else if (!strncmp(tok, "refresh=", 8)) {
+            const char *v = tok + 8;
+            if (!strcmp(v, "off") || !strcmp(v, "none") || !strcmp(v, "never"))
+                jfs_mount_cfg.refresh_mode = JFS_REFRESH_OFF;
+            else if (!strcmp(v, "periodic") || !strcmp(v, "eventual"))
+                jfs_mount_cfg.refresh_mode = JFS_REFRESH_PERIODIC;
+            else if (!strcmp(v, "strict") || !strcmp(v, "always"))
+                jfs_mount_cfg.refresh_mode = JFS_REFRESH_STRICT;
+            else {
+                fprintf(stderr, "%s: refresh must be periodic, strict or off\n", prog);
+                exit(2);
+            }
+        } else if (!strncmp(tok, "refresh_interval=", 17)) {
+            jfs_mount_cfg.refresh_interval_ms = (int)(atof(tok + 17) * 1000);
+            if (jfs_mount_cfg.refresh_interval_ms < 100)
+                jfs_mount_cfg.refresh_interval_ms = 100;
+        } else if (!strncmp(tok, "refresh_min=", 12)) {
+            jfs_mount_cfg.refresh_min_ms = (int)(atof(tok + 12) * 1000);
+        } else if (!strcmp(tok, "events") || !strcmp(tok, "events=on")) {
+            jfs_mount_cfg.events = 1;
+        } else if (!strcmp(tok, "noevents") || !strcmp(tok, "events=off")) {
+            jfs_mount_cfg.events = 0;
+        } else if (!strncmp(tok, "cache=", 6)) {
+            free(jfs_mount_cfg.cache);
+            jfs_mount_cfg.cache = jfs_strdup(tok + 6);
         } else if (!strncmp(tok, "commit=", 7)) {
             jfs_mount_cfg.commit_interval_ms = (int)(atof(tok + 7) * 1000);
         } else if (!strncmp(tok, "backend=", 8)) {
@@ -177,6 +210,48 @@ static char *absolute_path(const char *p)
 #endif
 }
 
+/* $XDG_CACHE_HOME/jsonfs (or ~/.cache/jsonfs, %LOCALAPPDATA%\\jsonfs) + hash of the URL */
+static char *default_cache_path(const char *url)
+{
+    uint8_t h[32];
+    char hex[65], *dir;
+    const char *base;
+    jfs_sha256_buf(url, strlen(url), h);
+    jfs_hex(h, 32, hex);
+    hex[24] = 0;
+#ifdef _WIN32
+    base = getenv("LOCALAPPDATA");
+    dir = jfs_asprintf("%s\\jsonfs", base ? base : ".");
+    {
+        wchar_t *w = jfs_utf8_to_wide(dir);
+        CreateDirectoryW(w, NULL);
+        free(w);
+    }
+    {
+        char *r = jfs_asprintf("%s\\%s.json", dir, hex);
+        free(dir);
+        return r;
+    }
+#else
+    base = getenv("XDG_CACHE_HOME");
+    if (base && *base) {
+        dir = jfs_asprintf("%s/jsonfs", base);
+    } else {
+        const char *home = getenv("HOME");
+        char *c = jfs_asprintf("%s/.cache", home ? home : "/tmp");
+        mkdir(c, 0700);
+        free(c);
+        dir = jfs_asprintf("%s/.cache/jsonfs", home ? home : "/tmp");
+    }
+    mkdir(dir, 0700);
+    {
+        char *r = jfs_asprintf("%s/%s.json", dir, hex);
+        free(dir);
+        return r;
+    }
+#endif
+}
+
 #ifndef _WIN32
 static int daemon_mode;
 static void syslog_sink(const char *msg)
@@ -200,6 +275,7 @@ int jfs_mount_open_volume(void)
     o.commit_interval_ms = jfs_mount_cfg.commit_interval_ms;
     o.has_at = jfs_mount_cfg.has_at;
     o.at = jfs_mount_cfg.at;
+    o.cache_path = jfs_mount_cfg.cache;
     rc = jfs_open(jfs_mount_cfg.image, &o, &jfs_mount_fs, err, sizeof err);
     if (rc) {
         fprintf(stderr, "%s: %s\n", prog, err);
@@ -255,6 +331,9 @@ int main(int argc, char **argv)
 
     memset(&jfs_mount_cfg, 0, sizeof jfs_mount_cfg);
     jfs_mount_cfg.commit_interval_ms = 5000;
+    jfs_mount_cfg.refresh_mode = JFS_REFRESH_PERIODIC;
+    jfs_mount_cfg.refresh_interval_ms = 60000;
+    jfs_mount_cfg.events = 1;
     jfs_mount_cfg.status_fd = -1;
 
     for (i = 1; i < argc; i++) {
@@ -322,6 +401,14 @@ int main(int argc, char **argv)
         }
         jfs_mount_cfg.readonly = 1;
         jfs_mount_cfg.image = jfs_strdup(pos[0]);
+        if (jfs_mount_cfg.cache && !strcmp(jfs_mount_cfg.cache, "auto")) {
+            free(jfs_mount_cfg.cache);
+            jfs_mount_cfg.cache = default_cache_path(pos[0]);
+        } else if (jfs_mount_cfg.cache) {
+            char *abs = absolute_path(jfs_mount_cfg.cache);
+            free(jfs_mount_cfg.cache);
+            jfs_mount_cfg.cache = abs;
+        }
         if (insecure && !strncmp(pos[0], "https", 5))
             fprintf(stderr, "%s: warning: TLS certificate verification is disabled (--insecure)\n", prog);
     } else if (jfs_mount_cfg.image = absolute_path(pos[0]), !jfs_file_exists(jfs_mount_cfg.image)) {

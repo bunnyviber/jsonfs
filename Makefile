@@ -9,7 +9,7 @@
 # loaded at runtime (dlopen) on Linux, macOS and FreeBSD; WinFsp / Dokan are
 # loaded at runtime on Windows, so no driver SDK is needed to link.
 
-VERSION     := 1.1.0
+VERSION     := 1.2.0
 TARGET      ?= native
 BUILD       ?= build/$(TARGET)
 
@@ -22,9 +22,9 @@ CFLAGS      += $(CSTD) $(OPT) $(WARN) -DJFS_BUILD_VERSION=\"$(VERSION)\" $(TARGE
 LDFLAGS     += $(TARGET_LDFLAGS)
 
 LIB_SRCS    := src/lib/jfs_util.c src/lib/jfs_json.c src/lib/jfs_codec.c src/lib/jfs_deflate.c \
-               src/lib/jfs_image.c src/lib/jfs_vfs.c src/lib/jfs_maint.c src/lib/jfs_http.c
+               src/lib/jfs_image.c src/lib/jfs_vfs.c src/lib/jfs_maint.c src/lib/jfs_http.c src/lib/jfs_remote.c
 TOOL_SRCS   := src/tools/jsonfs.c
-MOUNT_SRCS  := src/mount/mount_main.c src/mount/mount_fuse.c src/mount/mount_dokan.c
+MOUNT_SRCS  := src/mount/mount_main.c src/mount/mount_fuse.c src/mount/mount_dokan.c src/mount/mount_refresh.c
 
 LIB_OBJS    := $(patsubst src/%.c,$(BUILD)/obj/%.o,$(LIB_SRCS))
 TOOL_OBJS   := $(patsubst src/%.c,$(BUILD)/obj/%.o,$(TOOL_SRCS))
