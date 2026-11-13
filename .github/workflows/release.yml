@@ -44,12 +44,12 @@ jobs:
       - name: Toolchains
         run: |
           sudo apt-get update
-          sudo apt-get install -y mingw-w64 nsis zip fuse3 libfuse2t64
+          sudo apt-get install -y mingw-w64 nsis zip unzip fuse3 libfuse2t64 libarchive13t64 libarchive-tools p7zip-full zstd
           scripts/fetch-deps.sh all
 
       - name: Test (native)
         run: |
-          make -j4
+          make -j4 all build/native/bin/jfs-unit-tests
           mkdir -p /tmp/u && build/native/bin/jfs-unit-tests /tmp/u
           sh tests/toolkit_test.sh "$PWD/build/native/bin/jsonfs"
           sh tests/archive_test.sh "$PWD/build/native/bin/jsonfs"
