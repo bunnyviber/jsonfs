@@ -34,9 +34,9 @@ for tool in python3 openssl; do
     fi
 done
 
-start_server() { # name dir [cert key]  -> sets PORT
+start_server() { # name dir [cert key] [--no-validators] -> sets PORT
     rm -f "$T/$1.port"
-    python3 "$HERE/http_server.py" "$2" "$T/$1.port" ${3:-} ${4:-} &
+    python3 "$HERE/http_server.py" "$2" "$T/$1.port" ${3:-} ${4:-} ${5:-} &
     PIDS="$PIDS $!"
     i=0
     while [ ! -s "$T/$1.port" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
@@ -134,6 +134,125 @@ if [ $fuse_ok = 1 ]; then
         check "at= view content" test -f mnt/dir/n.txt
         check "unmount at= view" umnt mnt
         MOUNTED=""
+        # ---- refresh of web mounts ------------------------------------------------
+        mkdir -p r/www r/src r/mnt
+        printf 'one\n' >r/src/a.txt
+        mkdir r/src/d && printf 'x\n' >r/src/d/x.txt && printf 'gone soon\n' >r/src/del.txt
+        "$J" pack r/src r/www/img.json >/dev/null
+        start_server r1 r/www
+        R1=$PORT
+        URL="http://127.0.0.1:$R1/img.json"
+        check "mount with periodic refresh" "$M" -o refresh_interval=0.5 "$URL" r/mnt
+        MOUNTED="$T/r/mnt"
+        linux_events=0
+        if [ "$(uname -s)" = Linux ]; then
+            linux_events=1
+            python3 "$HERE/inotify_watch.py" ev.txt 7 r/mnt r/mnt/d &
+            i=0
+            while [ ! -f ev.txt.ready ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+        fi
+        printf 'two\n' >two.txt
+        "$J" add -f r/www/img.json two.txt /a.txt >/dev/null
+        "$J" add r/www/img.json two.txt /d/new.txt >/dev/null
+        "$J" mv r/www/img.json /d/x.txt /moved.txt >/dev/null
+        "$J" rm r/www/img.json /del.txt >/dev/null
+        "$J" mkdir r/www/img.json /newdir >/dev/null
+        "$J" add r/www/img.json two.txt /newdir/n.txt >/dev/null
+        i=0
+        while [ $i -lt 60 ] && [ ! -e r/mnt/newdir/n.txt ]; do sleep 0.1; i=$((i + 1)); done
+        # metadata-only change (same content, new mtime) -> ATTRIB
+        sleep 0.3
+        touch -d "2020-01-01 00:00:00" two.txt
+        "$J" add -f r/www/img.json two.txt /d/new.txt >/dev/null
+        sleep 1.5
+        expect "periodic refresh: modified content" "two" "$(cat r/mnt/a.txt)"
+        check "periodic refresh: new file" test -f r/mnt/d/new.txt
+        check "periodic refresh: rename" test -f r/mnt/moved.txt
+        check "periodic refresh: delete" test ! -e r/mnt/del.txt
+        check "periodic refresh: new directory" test -f r/mnt/newdir/n.txt
+        if [ $linux_events = 1 ]; then
+            sleep 5.5
+            check "inotify: CREATE" grep -q "CREATE r/mnt/d/new.txt" ev.txt
+            check "inotify: MODIFY" grep -q "MODIFY r/mnt/a.txt" ev.txt
+            check "inotify: MOVED_FROM" grep -q "MOVED_FROM r/mnt/d/x.txt" ev.txt
+            check "inotify: MOVED_TO" grep -q "MOVED_TO r/mnt/moved.txt" ev.txt
+            check "inotify: DELETE" grep -q "DELETE r/mnt/del.txt" ev.txt
+            check "inotify: mkdir" grep -q "CREATE r/mnt/newdir" ev.txt
+            check "inotify: ATTRIB (metadata-only change)" grep -q "ATTRIB r/mnt/d/new.txt" ev.txt
+            [ $fail -eq 0 ] || sed 's/^/    event: /' ev.txt >&2
+        fi
+        # unchanged image: only 304s, no bodies
+        : >"$T/r1.port.log"
+        sleep 2
+        n304=$(grep -c " 304 0$" "$T/r1.port.log")
+        nother=$(grep -vc " 304 0$" "$T/r1.port.log")
+        [ "$n304" -ge 2 ] && ok || bad "unchanged image is revalidated with 304 (got $n304)"
+        expect "no full downloads while unchanged" "0" "$nother"
+        # image removed / failing: keep serving the last version
+        mv r/www/img.json r/www/img.json.bak
+        sleep 1.5
+        expect "removed image: last version kept" "two" "$(cat r/mnt/a.txt)"
+        check "removed image: tree kept" test -f r/mnt/newdir/n.txt
+        mv r/www/img.json.bak r/www/img.json
+        printf 'back\n' >back.txt
+        "$J" add r/www/img.json back.txt / >/dev/null
+        i=0
+        while [ $i -lt 40 ] && [ ! -e r/mnt/back.txt ]; do sleep 0.1; i=$((i + 1)); done
+        check "updates resume after the image is back" test -e r/mnt/back.txt
+        check_fails "web mount is still read-only" sh -c "echo x > r/mnt/w.txt"
+        check "unmount refreshing mount" umnt r/mnt
+        MOUNTED=""
+
+        # strict mode: every open / listing sees the newest version immediately
+        check "mount with strict refresh" "$M" -o refresh=strict,refresh_interval=3600 "$URL" r/mnt
+        MOUNTED="$T/r/mnt"
+        printf 'strict\n' >strict.txt
+        "$J" add -f r/www/img.json strict.txt /a.txt >/dev/null
+        expect "strict: open sees the new content at once" "strict" "$(cat r/mnt/a.txt)"
+        "$J" add r/www/img.json strict.txt /strict.txt >/dev/null
+        check "strict: listing sees the new file at once" sh -c "ls r/mnt | grep -q strict.txt"
+        check "unmount strict" umnt r/mnt
+        MOUNTED=""
+
+        # servers without ETag/Last-Modified: 4 KiB header probes
+        mkdir -p r2/www && cp r/www/img.json r2/www/img.json
+        start_server r2 r2/www --no-validators
+        R2=$PORT
+        check "mount (server without validators)" "$M" -o refresh_interval=0.5 "http://127.0.0.1:$R2/img.json" r/mnt
+        MOUNTED="$T/r/mnt"
+        sleep 1.5
+        nprobe=$(grep -c " 206 " "$T/r2.port.log")
+        big=$(awk '$3 == 206 && $4 > 4096' "$T/r2.port.log" | wc -l | tr -d ' ')
+        [ "$nprobe" -ge 2 ] && ok || bad "header probes used without validators (got $nprobe)"
+        expect "probes are at most 4 KiB" "0" "$big"
+        printf 'probe\n' >probe.txt
+        "$J" add r2/www/img.json probe.txt / >/dev/null
+        i=0
+        while [ $i -lt 40 ] && [ ! -e r/mnt/probe.txt ]; do sleep 0.1; i=$((i + 1)); done
+        check "probe mode picks up changes" test -f r/mnt/probe.txt
+        check "unmount probe mode" umnt r/mnt
+        MOUNTED=""
+
+        # on-disk cache: revalidated with a conditional request, used when offline
+        check "mount with cache" "$M" -o cache="$T/cache.json",refresh=off "$URL" r/mnt
+        MOUNTED="$T/r/mnt"
+        check "cache file written" test -s "$T/cache.json"
+        check "unmount cache mount" umnt r/mnt
+        MOUNTED=""
+        : >"$T/r1.port.log"
+        check "remount with cache" "$M" -o cache="$T/cache.json",refresh=off "$URL" r/mnt
+        MOUNTED="$T/r/mnt"
+        expect "remount revalidates the cache with a 304" "304" "$(awk 'NR==1{print $3}' "$T/r1.port.log")"
+        expect "remount from cache content" "strict" "$(cat r/mnt/a.txt)"
+        check "unmount cache mount 2" umnt r/mnt
+        MOUNTED=""
+        mv r/www/img.json r/www/gone.json
+        check "mount from cache while the image is gone" "$M" -o cache="$T/cache.json" "$URL" r/mnt
+        MOUNTED="$T/r/mnt"
+        expect "offline content from cache" "strict" "$(cat r/mnt/a.txt)"
+        check "unmount offline mount" umnt r/mnt
+        MOUNTED=""
+        check_fails "without a cache the mount fails" "$M" "$URL" r/mnt
     elif grep -qi "FUSE is not available" err.txt; then
         echo "http tests: FUSE part skipped ($(head -1 err.txt))"
     else

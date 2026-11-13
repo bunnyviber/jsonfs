@@ -118,6 +118,7 @@ typedef struct jfs_open_opts {
     jfs_time at;
     int commit_interval_ms;  /* exclusive mode: <=0 commits after every change */
     int repair;              /* tolerate/fix inconsistencies while loading */
+    const char *cache_path;  /* remote images: keep the latest copy here (NULL = none) */
 } jfs_open_opts;
 
 void jfs_open_opts_init(jfs_open_opts *o);
@@ -126,6 +127,8 @@ int jfs_open(const char *image, const jfs_open_opts *o, jfs_fs **out, char *err,
 int jfs_sync(jfs_fs *fs);
 /* Commit, release locks and free. */
 int jfs_close(jfs_fs *fs);
+/* Release locks and free WITHOUT committing pending changes. */
+void jfs_abort(jfs_fs *fs);
 /* Starts the periodic background committer (exclusive mode). Call after a
  * possible fork()/daemonize. */
 int jfs_start_committer(jfs_fs *fs);
@@ -148,6 +151,79 @@ typedef struct jfs_info {
     uint64_t logical_bytes;
 } jfs_info;
 void jfs_get_info(jfs_fs *fs, jfs_info *info);
+
+/* ---------------------------------------------------------------------- */
+/* Remote (http/https) images: refreshing and change propagation           */
+/* ---------------------------------------------------------------------- */
+typedef struct jfs_remote_stats {
+    uint64_t checks;           /* refresh checks performed */
+    uint64_t not_modified;     /* answered by 304 / identical header probe */
+    uint64_t probes;           /* small range requests (servers without ETag) */
+    uint64_t full_downloads;   /* complete image transfers (incl. the initial one) */
+    uint64_t bytes_downloaded; /* body bytes received */
+    uint64_t updates;          /* new versions installed */
+    uint64_t failures;         /* checks that failed (old copy kept) */
+    jfs_time last_check, last_update;
+    int serving_cached_copy;   /* mounted from the on-disk cache, server unreachable */
+    char last_error[256];
+} jfs_remote_stats;
+
+int jfs_is_remote(jfs_fs *fs);
+void jfs_remote_get_stats(jfs_fs *fs, jfs_remote_stats *st);
+
+/* A newer version of a remote image, fetched but not yet visible. */
+typedef struct jfs_pending jfs_pending;
+
+/* Checks the server for a newer version without blocking file operations.
+ * Uses If-None-Match when the server sent an ETag, otherwise a 4 KiB range
+ * request of the image header; only downloads the full image when it
+ * changed.  Returns 0 and *out == NULL when nothing changed, 0 and a pending
+ * update otherwise, or a negative error (the current copy stays in use). */
+int jfs_refresh_check(jfs_fs *fs, jfs_pending **out, char *err, size_t errlen);
+void jfs_pending_free(jfs_pending *p);
+
+/* Changes between the visible state and a pending one, in an order that can
+ * be replayed through the kernel (parents before children, renames first,
+ * deletions before creations). */
+enum {
+    JFS_CHANGE_CREATE = 1, /* path, type in mode, symlink target, rdev */
+    JFS_CHANGE_LINK,       /* path = new name, path2 = existing name */
+    JFS_CHANGE_DELETE,     /* path, type in mode */
+    JFS_CHANGE_RENAME,     /* path -> path2 */
+    JFS_CHANGE_MODIFY,     /* content changed (size = new size) */
+    JFS_CHANGE_ATTRIB      /* metadata changed */
+};
+typedef struct jfs_change {
+    int kind;
+    char *path, *path2;
+    uint32_t mode;
+    uint64_t size, rdev;
+    char *target;
+} jfs_change;
+typedef struct jfs_changes {
+    jfs_change *v;
+    size_t n, cap;
+} jfs_changes;
+int jfs_pending_diff(jfs_fs *fs, jfs_pending *p, jfs_changes *out);
+void jfs_changes_free(jfs_changes *c);
+
+/* Replay protocol (used by the mount drivers to make the kernel emit
+ * filesystem events, e.g. inotify, for remote changes): after
+ * jfs_replay_begin() the driver performs the changes as ordinary system
+ * calls on its own mount point; its request handlers recognise those calls
+ * and apply them with the jfs_replay_* functions, which copy the state from
+ * the pending version.  jfs_pending_install() then makes the state exactly
+ * equal to the pending version (also when some replayed call failed) and
+ * frees it. */
+void jfs_replay_begin(jfs_fs *fs, jfs_pending *p);
+int jfs_replay_active(jfs_fs *fs);
+int jfs_replay_create(jfs_fs *fs, const char *path);
+int jfs_replay_link(jfs_fs *fs, const char *existing, const char *path);
+int jfs_replay_remove(jfs_fs *fs, const char *path);
+int jfs_replay_rename(jfs_fs *fs, const char *from, const char *to);
+int jfs_replay_update(jfs_fs *fs, const char *path);
+int jfs_replay_update_handle(jfs_fs *fs, jfs_handle *h);
+void jfs_pending_install(jfs_fs *fs, jfs_pending *p);
 
 /* ---------------------------------------------------------------------- */
 /* POSIX operations (paths are absolute, '/'-separated, UTF-8)             */

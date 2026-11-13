@@ -19,6 +19,7 @@
 #include "../lib/jfs_codec.h"
 #include "../lib/jfs_fs.h"
 #include "../lib/jfs_http.h"
+#include "../lib/jfs_archive.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -39,6 +40,8 @@
 #endif
 
 static const char *prog = "jsonfs";
+static int g_overwrite; /* add -f: replace existing non-directories */
+static int img_type(jfs_fs *fs, const char *path);
 
 static void die(const char *fmt, ...)
 {
@@ -803,7 +806,22 @@ static int import_tree(jfs_fs *fs, const char *host, const char *dst, uint64_t *
         if (rc)
             return rc;
     } else if (S_ISREG(st.st_mode)) {
+        /* keep hard links: the second name of an inode becomes a link */
+        static jfs_u64map seen_inodes;
+        uint64_t key = ((uint64_t)st.st_dev << 40) ^ (uint64_t)st.st_ino;
+        const char *first = st.st_nlink > 1 ? jfs_u64map_get(&seen_inodes, key) : NULL;
+        if (first && img_type(fs, first) == JFS_S_IFREG) {
+            if (g_overwrite && img_type(fs, dst))
+                jfs_unlink(fs, dst);
+            rc = jfs_link(fs, first, dst);
+            if (!rc) {
+                (*nfiles)++;
+                return 0; /* metadata is shared with the first name */
+            }
+        }
         rc = import_file_data(fs, host, dst, 0600, bytes);
+        if (!rc && st.st_nlink > 1)
+            jfs_u64map_put(&seen_inodes, key, jfs_strdup(dst));
     } else if (S_ISLNK(st.st_mode)) {
         char tgt[4096];
         ssize_t n = readlink(host, tgt, sizeof tgt - 1);
@@ -811,9 +829,13 @@ static int import_tree(jfs_fs *fs, const char *host, const char *dst, uint64_t *
             return -JFS_EIO;
         tgt[n] = 0;
         rc = jfs_symlink(fs, tgt, dst, &c);
+        if (rc == -JFS_EEXIST && g_overwrite && jfs_unlink(fs, dst) == 0)
+            rc = jfs_symlink(fs, tgt, dst, &c);
     } else {
         uint32_t m = (uint32_t)(st.st_mode & 0170000) | 0600;
         rc = jfs_mknod(fs, dst, m, (uint64_t)st.st_rdev, &c);
+        if (rc == -JFS_EEXIST && g_overwrite && jfs_unlink(fs, dst) == 0)
+            rc = jfs_mknod(fs, dst, m, (uint64_t)st.st_rdev, &c);
     }
     if (rc)
         return rc;
@@ -1088,6 +1110,722 @@ static int cmd_export(int argc, char **argv)
     return 0;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Folder <-> image conversion and offline file manipulation                  */
+/* ------------------------------------------------------------------------ */
+
+/* -1 missing, 0 empty directory, 1 non-empty directory, 2 not a directory */
+static int host_dir_state(const char *path)
+{
+#ifdef _WIN32
+    wchar_t *w = jfs_utf8_to_wide(path);
+    DWORD attr = GetFileAttributesW(w);
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    char *pat;
+    int state = 0;
+    free(w);
+    if (attr == INVALID_FILE_ATTRIBUTES)
+        return -1;
+    if (!(attr & FILE_ATTRIBUTE_DIRECTORY))
+        return 2;
+    pat = join(path, "*");
+    w = jfs_utf8_to_wide(pat);
+    free(pat);
+    h = FindFirstFileW(w, &fd);
+    free(w);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") && wcscmp(fd.cFileName, L".."))
+                state = 1;
+        } while (!state && FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return state;
+#else
+    struct stat st;
+    DIR *d;
+    struct dirent *de;
+    int state = 0;
+    if (stat(path, &st) != 0)
+        return -1;
+    if (!S_ISDIR(st.st_mode))
+        return 2;
+    d = opendir(path);
+    if (!d)
+        return 1;
+    while (!state && (de = readdir(d)))
+        if (strcmp(de->d_name, ".") && strcmp(de->d_name, ".."))
+            state = 1;
+    closedir(d);
+    return state;
+#endif
+}
+
+static const char *base_name(const char *p)
+{
+    const char *e = p + strlen(p), *b;
+    while (e > p + 1 && (e[-1] == '/' || e[-1] == '\\'))
+        e--;
+    b = e;
+    while (b > p && b[-1] != '/' && b[-1] != '\\')
+        b--;
+    {
+        static char buf[4096];
+        size_t n = (size_t)(e - b);
+        if (n >= sizeof buf)
+            n = sizeof buf - 1;
+        memcpy(buf, b, n);
+        buf[n] = 0;
+        return buf;
+    }
+}
+
+/* Image paths: make absolute, strip trailing slashes. */
+static char *img_path(const char *p)
+{
+    char *r = p[0] == '/' ? jfs_strdup(p) : jfs_asprintf("/%s", p);
+    size_t n = strlen(r);
+    while (n > 1 && r[n - 1] == '/')
+        r[--n] = 0;
+    return r;
+}
+
+static char *img_join(const char *dir, const char *name)
+{
+    return strcmp(dir, "/") ? jfs_asprintf("%s/%s", dir, name) : jfs_asprintf("/%s", name);
+}
+
+static int img_type(jfs_fs *fs, const char *path)
+{
+    jfs_stat st;
+    if (jfs_getattr(fs, path, &st))
+        return 0;
+    return (int)(st.mode & JFS_S_IFMT);
+}
+
+static int mkdir_p(jfs_fs *fs, const char *path, uint32_t mode)
+{
+    char *p = img_path(path), *s;
+    jfs_ctx c = tool_ctx();
+    int rc = 0;
+    for (s = p + 1;; s++) {
+        if (*s == '/' || !*s) {
+            char save = *s;
+            *s = 0;
+            rc = jfs_mkdir(fs, p, mode, &c);
+            if (rc == -JFS_EEXIST)
+                rc = img_type(fs, p) == JFS_S_IFDIR ? 0 : -JFS_ENOTDIR;
+            *s = save;
+            if (rc || !save)
+                break;
+        }
+    }
+    free(p);
+    return rc;
+}
+
+static int rm_tree(jfs_fs *fs, const char *path);
+
+typedef struct rm_ctx {
+    jfs_fs *fs;
+    const char *dir;
+    char **names;
+    size_t n, cap;
+} rm_ctx;
+
+static int rm_collect(void *cookie, const char *name, const jfs_stat *st)
+{
+    rm_ctx *r = cookie;
+    (void)st;
+    if (!strcmp(name, ".") || !strcmp(name, ".."))
+        return 0;
+    if (r->n == r->cap) {
+        r->cap = r->cap ? r->cap * 2 : 16;
+        r->names = jfs_realloc(r->names, r->cap * sizeof(char *));
+    }
+    r->names[r->n++] = jfs_strdup(name);
+    return 0;
+}
+
+static int rm_tree(jfs_fs *fs, const char *path)
+{
+    rm_ctx r;
+    size_t i;
+    int rc = 0;
+    if (img_type(fs, path) != JFS_S_IFDIR)
+        return jfs_unlink(fs, path);
+    memset(&r, 0, sizeof r);
+    r.fs = fs;
+    r.dir = path;
+    rc = jfs_readdir(fs, path, rm_collect, &r);
+    for (i = 0; i < r.n; i++) {
+        char *child = img_join(path, r.names[i]);
+        if (!rc)
+            rc = rm_tree(fs, child);
+        free(child);
+        free(r.names[i]);
+    }
+    free(r.names);
+    return rc ? rc : jfs_rmdir(fs, path);
+}
+
+/* finish an offline modification: commit on success, discard on failure */
+static int finish_rw(jfs_fs *fs, int rc, const char *what)
+{
+    if (rc) {
+        jfs_abort(fs);
+        fprintf(stderr, "%s: %s failed: %s (image left unchanged)\n", prog, what, jfs_strerror(rc));
+        return rc == -JFS_ELOCKED ? 3 : 1;
+    }
+    rc = jfs_close(fs);
+    return rc ? fail(rc, "commit") : 0;
+}
+
+static int cmd_pack(int argc, char **argv)
+{
+    args a;
+    const char *o;
+    jfs_mkfs_opts mo;
+    jfs_fs *fs;
+    int force = 0, rc, state;
+    uint64_t n = 0, bytes = 0;
+    memset(&mo, 0, sizeof mo);
+    args_init(&a, argc, argv);
+    while ((o = args_next(&a))) {
+        if (is(o, "-L", "--label"))
+            mo.label = args_value(&a, o);
+        else if (is(o, "-c", "--compression"))
+            mo.compression = args_value(&a, o);
+        else if (is(o, "-V", "--versioning"))
+            mo.versioning = 1;
+        else if (is(o, NULL, "--schema"))
+            mo.schema = atoi(args_value(&a, o));
+        else if (is(o, "-f", "--force"))
+            force = 1;
+        else
+            die("pack: unknown option %s", o);
+    }
+    if (a.npos != 2)
+        die("usage: jsonfs pack [-L label] [-c compression] [-V] [-f] FOLDER IMAGE");
+    state = host_dir_state(a.pos[0]);
+    if (state < 0 || state == 2)
+        die("%s is not a folder", a.pos[0]);
+    if (jfs_is_url(a.pos[1]))
+        die("cannot create an image at a URL");
+    if (mo.compression && jfs_compression_parse(mo.compression, NULL, NULL))
+        die("unknown compression \"%s\" (see 'jsonfs compressors')", mo.compression);
+#ifndef _WIN32
+    if (getuid() != 0) {
+        mo.root_uid = (uint32_t)getuid();
+        mo.root_gid = (uint32_t)getgid();
+    }
+#endif
+    rc = jfs_mkfs(a.pos[1], &mo, force);
+    if (rc == -JFS_EEXIST)
+        die("%s already exists (use -f to overwrite)", a.pos[1]);
+    if (rc)
+        return fail(rc, a.pos[1]);
+    open_rw(a.pos[1], &fs);
+    rc = import_tree(fs, a.pos[0], "/", &n, &bytes);
+    if (rc) {
+        char lock[4200];
+        jfs_abort(fs);
+        jfs_remove_file(a.pos[1]); /* do not leave a half-filled image behind */
+        snprintf(lock, sizeof lock, "%s.lock", a.pos[1]);
+        jfs_remove_file(lock);
+        return fail(rc, "pack");
+    }
+    rc = jfs_close(fs);
+    if (rc)
+        return fail(rc, "commit");
+    printf("packed %s into %s: %llu object(s), %llu bytes\n", a.pos[0], a.pos[1], (unsigned long long)n,
+           (unsigned long long)bytes);
+    return 0;
+}
+
+static int cmd_unpack(int argc, char **argv)
+{
+    args a;
+    const char *o, *at = NULL;
+    jfs_fs *fs;
+    int force = 0, rc, state;
+    uint64_t n = 0, bytes = 0;
+    args_init(&a, argc, argv);
+    while ((o = args_next(&a))) {
+        if (is(o, "-t", "--at"))
+            at = args_value(&a, o);
+        else if (is(o, "-f", "--force"))
+            force = 1;
+        else
+            die("unpack: unknown option %s", o);
+    }
+    if (a.npos != 2)
+        die("usage: jsonfs unpack [--at TIME] [-f] IMAGE FOLDER");
+    state = host_dir_state(a.pos[1]);
+    if (state == 2)
+        die("%s exists and is not a folder", a.pos[1]);
+    if (state == 1 && !force)
+        die("%s is not empty (use -f to extract into it anyway)", a.pos[1]);
+    open_ro(a.pos[0], at, &fs);
+    rc = export_tree(fs, "/", a.pos[1], &n, &bytes);
+    jfs_close(fs);
+    if (rc)
+        return fail(rc, "unpack");
+    printf("unpacked %s into %s: %llu object(s), %llu bytes\n", a.pos[0], a.pos[1], (unsigned long long)n,
+           (unsigned long long)bytes);
+    return 0;
+}
+
+static int cmd_add(int argc, char **argv)
+{
+    args a;
+    const char *o;
+    jfs_fs *fs;
+    int parents = 0, rc = 0, i, nsrc;
+    uint64_t n = 0, bytes = 0;
+    char *dest;
+    args_init(&a, argc, argv);
+    while ((o = args_next(&a))) {
+        if (is(o, "-f", "--force"))
+            g_overwrite = 1;
+        else if (is(o, "-p", "--parents"))
+            parents = 1;
+        else
+            die("add: unknown option %s", o);
+    }
+    if (a.npos < 3)
+        die("usage: jsonfs add [-f] [-p] IMAGE HOST_PATH... IMAGE_DEST");
+    nsrc = a.npos - 2;
+    dest = img_path(a.pos[a.npos - 1]);
+    open_rw(a.pos[0], &fs);
+    if (parents) {
+        const char *raw = a.pos[a.npos - 1];
+        if (nsrc > 1 || raw[strlen(raw) - 1] == '/')
+            rc = mkdir_p(fs, dest, 0755);
+        else {
+            char *parent = jfs_strdup(dest), *sl = strrchr(parent, '/');
+            if (sl && sl != parent) {
+                *sl = 0;
+                rc = mkdir_p(fs, parent, 0755);
+            }
+            free(parent);
+        }
+    }
+    for (i = 1; !rc && i <= nsrc; i++) {
+        const char *src = a.pos[i];
+        int into_dir = img_type(fs, dest) == JFS_S_IFDIR;
+        char *target;
+        int ttype, sdir = host_dir_state(src) >= 0 && host_dir_state(src) != 2;
+        if (host_dir_state(src) == -1) {
+            fprintf(stderr, "%s: %s: no such file or directory\n", prog, src);
+            rc = -JFS_ENOENT;
+            break;
+        }
+        if (nsrc > 1 && !into_dir) {
+            fprintf(stderr, "%s: %s is not a directory in the image\n", prog, dest);
+            rc = -JFS_ENOTDIR;
+            break;
+        }
+        target = into_dir ? img_join(dest, base_name(src)) : jfs_strdup(dest);
+        ttype = img_type(fs, target);
+        if (ttype) {
+            if (!g_overwrite) {
+                fprintf(stderr, "%s: %s already exists in the image (use -f to replace)\n", prog, target);
+                rc = -JFS_EEXIST;
+            } else if (ttype == JFS_S_IFDIR && !sdir) {
+                fprintf(stderr, "%s: cannot replace directory %s with a file\n", prog, target);
+                rc = -JFS_EISDIR;
+            } else if (ttype != JFS_S_IFDIR && sdir) {
+                rc = jfs_unlink(fs, target);
+            } else if (ttype != JFS_S_IFDIR && ttype != JFS_S_IFREG) {
+                rc = jfs_unlink(fs, target); /* symlink/special file replaced by a file */
+            }
+        }
+        if (!rc)
+            rc = import_tree(fs, src, target, &n, &bytes);
+        free(target);
+    }
+    free(dest);
+    rc = finish_rw(fs, rc, "add");
+    if (!rc)
+        printf("added %llu object(s), %llu bytes\n", (unsigned long long)n, (unsigned long long)bytes);
+    return rc;
+}
+
+static int cmd_mv(int argc, char **argv)
+{
+    args a;
+    const char *o;
+    jfs_fs *fs;
+    int noclobber = 0, rc = 0, i, nsrc;
+    char *dest;
+    args_init(&a, argc, argv);
+    while ((o = args_next(&a))) {
+        if (is(o, "-n", "--no-clobber"))
+            noclobber = 1;
+        else
+            die("mv: unknown option %s", o);
+    }
+    if (a.npos < 3)
+        die("usage: jsonfs mv [-n] IMAGE SOURCE... DEST");
+    nsrc = a.npos - 2;
+    dest = img_path(a.pos[a.npos - 1]);
+    open_rw(a.pos[0], &fs);
+    for (i = 1; !rc && i <= nsrc; i++) {
+        char *src = img_path(a.pos[i]), *target;
+        int into_dir = img_type(fs, dest) == JFS_S_IFDIR && strcmp(src, dest);
+        if (nsrc > 1 && !into_dir) {
+            fprintf(stderr, "%s: %s is not a directory in the image\n", prog, dest);
+            rc = -JFS_ENOTDIR;
+        } else {
+            target = into_dir ? img_join(dest, base_name(src)) : jfs_strdup(dest);
+            rc = jfs_rename(fs, src, target, noclobber ? JFS_RENAME_NOREPLACE : 0);
+            if (rc)
+                fprintf(stderr, "%s: cannot move %s to %s: %s\n", prog, src, target, jfs_strerror(rc));
+            free(target);
+        }
+        free(src);
+    }
+    free(dest);
+    return finish_rw(fs, rc, "mv");
+}
+
+static int cmd_rm(int argc, char **argv)
+{
+    args a;
+    const char *o;
+    jfs_fs *fs;
+    int recursive = 0, force = 0, rc = 0, i;
+    args_init(&a, argc, argv);
+    while ((o = args_next(&a))) {
+        if (is(o, "-r", "--recursive") || is(o, "-R", NULL))
+            recursive = 1;
+        else if (is(o, "-f", "--force"))
+            force = 1;
+        else if (!strcmp(o, "-rf") || !strcmp(o, "-fr"))
+            recursive = force = 1;
+        else
+            die("rm: unknown option %s", o);
+    }
+    if (a.npos < 2)
+        die("usage: jsonfs rm [-r] [-f] IMAGE PATH...");
+    open_rw(a.pos[0], &fs);
+    for (i = 1; !rc && i < a.npos; i++) {
+        char *p = img_path(a.pos[i]);
+        int t = img_type(fs, p);
+        if (!strcmp(p, "/")) {
+            fprintf(stderr, "%s: refusing to remove the root directory\n", prog);
+            rc = -JFS_EBUSY;
+        } else if (!t) {
+            if (!force) {
+                fprintf(stderr, "%s: %s: no such file or directory\n", prog, p);
+                rc = -JFS_ENOENT;
+            }
+        } else if (t == JFS_S_IFDIR && !recursive) {
+            fprintf(stderr, "%s: %s is a directory (use -r)\n", prog, p);
+            rc = -JFS_EISDIR;
+        } else {
+            rc = rm_tree(fs, p);
+        }
+        free(p);
+    }
+    return finish_rw(fs, rc, "rm");
+}
+
+static int cmd_mkdir(int argc, char **argv)
+{
+    args a;
+    const char *o;
+    jfs_fs *fs;
+    int parents = 0, rc = 0, i;
+    uint32_t mode = 0755;
+    jfs_ctx c = tool_ctx();
+    args_init(&a, argc, argv);
+    while ((o = args_next(&a))) {
+        if (is(o, "-p", "--parents"))
+            parents = 1;
+        else if (is(o, "-m", "--mode"))
+            mode = (uint32_t)strtoul(args_value(&a, o), NULL, 8);
+        else
+            die("mkdir: unknown option %s", o);
+    }
+    if (a.npos < 2)
+        die("usage: jsonfs mkdir [-p] [-m MODE] IMAGE PATH...");
+    open_rw(a.pos[0], &fs);
+    for (i = 1; !rc && i < a.npos; i++) {
+        char *p = img_path(a.pos[i]);
+        if (parents) {
+            rc = mkdir_p(fs, p, mode);
+        } else {
+            rc = jfs_mkdir(fs, p, mode, &c);
+            if (rc)
+                fprintf(stderr, "%s: mkdir %s: %s\n", prog, p, jfs_strerror(rc));
+        }
+        if (!rc)
+            jfs_chmod(fs, p, mode); /* exact mode, independent of any umask */
+        free(p);
+    }
+    return finish_rw(fs, rc, "mkdir");
+}
+
+static int cmd_get(int argc, char **argv)
+{
+    args a;
+    const char *o, *at = NULL;
+    jfs_fs *fs;
+    int force = 0, rc, state;
+    uint64_t n = 0, bytes = 0;
+    char *src, *dest;
+    args_init(&a, argc, argv);
+    while ((o = args_next(&a))) {
+        if (is(o, "-t", "--at"))
+            at = args_value(&a, o);
+        else if (is(o, "-f", "--force"))
+            force = 1;
+        else
+            die("get: unknown option %s", o);
+    }
+    if (a.npos < 2 || a.npos > 3)
+        die("usage: jsonfs get [--at TIME] [-f] IMAGE PATH [HOST_DEST]");
+    src = img_path(a.pos[1]);
+    open_ro(a.pos[0], at, &fs);
+    if (!img_type(fs, src)) {
+        jfs_close(fs);
+        die("%s: no such file or directory in the image", src);
+    }
+    if (a.npos == 3) {
+        state = host_dir_state(a.pos[2]);
+        dest = (state == 0 || state == 1) && strcmp(src, "/") ? join(a.pos[2], base_name(src)) : jfs_strdup(a.pos[2]);
+    } else {
+        dest = jfs_strdup(strcmp(src, "/") ? base_name(src) : ".");
+    }
+    state = host_dir_state(dest);
+    if (state != -1 && !force && !(state == 0 && img_type(fs, src) == JFS_S_IFDIR)) {
+        jfs_close(fs);
+        die("%s already exists (use -f to overwrite)", dest);
+    }
+    rc = export_tree(fs, src, dest, &n, &bytes);
+    jfs_close(fs);
+    if (rc)
+        return fail(rc, "get");
+    printf("extracted %s to %s: %llu object(s), %llu bytes\n", src, dest, (unsigned long long)n,
+           (unsigned long long)bytes);
+    free(src);
+    free(dest);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Archives (zip, tar, tar.gz built in; 7z, tar.xz, ... through libarchive)   */
+/* ------------------------------------------------------------------------ */
+static void ar_warn(void *cookie, const char *msg)
+{
+    (void)cookie;
+    fprintf(stderr, "%s: warning: %s\n", prog, msg);
+}
+
+static void ar_print_stats(const char *verb, const jfs_archive_stats *st)
+{
+    printf("%s %llu entries (%llu files, %llu directories, %llu symlinks, %llu hard links, %llu special), "
+           "%llu bytes [%s, %s]",
+           verb, (unsigned long long)st->entries, (unsigned long long)st->files, (unsigned long long)st->dirs,
+           (unsigned long long)st->symlinks, (unsigned long long)st->hardlinks, (unsigned long long)st->specials,
+           (unsigned long long)st->bytes, st->format, st->backend);
+    if (st->skipped)
+        printf(", %llu skipped", (unsigned long long)st->skipped);
+    printf("\n");
+}
+
+static int parse_backend(const char *v)
+{
+    if (!strcmp(v, "native") || !strcmp(v, "builtin"))
+        return JFS_AR_BACKEND_NATIVE;
+    if (!strcmp(v, "libarchive"))
+        return JFS_AR_BACKEND_LIBARCHIVE;
+    if (!strcmp(v, "auto"))
+        return JFS_AR_BACKEND_AUTO;
+    die("--backend must be auto, native or libarchive");
+    return 0;
+}
+
+static int cmd_from_archive(int argc, char **argv)
+{
+    args a;
+    const char *o, *into = NULL;
+    jfs_mkfs_opts mo;
+    jfs_archive_opts ao;
+    jfs_archive_stats st;
+    jfs_fs *fs;
+    char err[1024];
+    int force = 0, rc, created = 0;
+    memset(&mo, 0, sizeof mo);
+    jfs_archive_opts_init(&ao);
+    ao.warn = ar_warn;
+#ifndef _WIN32
+    ao.uid = (uint32_t)getuid();
+    ao.gid = (uint32_t)getgid();
+    ao.same_owner = getuid() == 0; /* like tar: keep owners only as root */
+#else
+    ao.same_owner = 0;
+#endif
+    args_init(&a, argc, argv);
+    while ((o = args_next(&a))) {
+        if (is(o, "-F", "--format"))
+            ao.format = args_value(&a, o);
+        else if (is(o, NULL, "--backend"))
+            ao.backend = parse_backend(args_value(&a, o));
+        else if (is(o, NULL, "--same-owner"))
+            ao.same_owner = 1;
+        else if (is(o, NULL, "--no-same-owner"))
+            ao.same_owner = 0;
+        else if (is(o, "-i", "--into"))
+            into = args_value(&a, o);
+        else if (is(o, "-L", "--label"))
+            mo.label = args_value(&a, o);
+        else if (is(o, "-c", "--compression"))
+            mo.compression = args_value(&a, o);
+        else if (is(o, "-V", "--versioning"))
+            mo.versioning = 1;
+        else if (is(o, "-f", "--force"))
+            force = 1;
+        else
+            die("from-archive: unknown option %s", o);
+    }
+    if (a.npos != 2)
+        die("usage: jsonfs from-archive [-F FORMAT] [-L label] [-c algo] [-V] [-f] [--into PATH]\n"
+            "                           [--same-owner|--no-same-owner] [--backend B] ARCHIVE IMAGE");
+    if (jfs_is_url(a.pos[1]))
+        die("cannot write an image at a URL");
+    if (!into) {
+        if (mo.compression && jfs_compression_parse(mo.compression, NULL, NULL))
+            die("unknown compression \"%s\"", mo.compression);
+        mo.root_uid = ao.uid;
+        mo.root_gid = ao.gid;
+        rc = jfs_mkfs(a.pos[1], &mo, force);
+        if (rc == -JFS_EEXIST)
+            die("%s already exists (use -f to overwrite, or --into PATH to add to it)", a.pos[1]);
+        if (rc)
+            return fail(rc, a.pos[1]);
+        created = 1;
+    }
+    open_rw(a.pos[1], &fs);
+    rc = jfs_archive_import(fs, a.pos[0], into ? into : "/", &ao, &st, err, sizeof err);
+    if (rc) {
+        jfs_abort(fs);
+        if (created) {
+            char lock[4200];
+            jfs_remove_file(a.pos[1]);
+            snprintf(lock, sizeof lock, "%s.lock", a.pos[1]);
+            jfs_remove_file(lock);
+        }
+        fprintf(stderr, "%s: %s\n", prog, err[0] ? err : jfs_strerror(rc));
+        if (!created)
+            fprintf(stderr, "%s: image left unchanged\n", prog);
+        return 1;
+    }
+    rc = jfs_close(fs);
+    if (rc)
+        return fail(rc, "commit");
+    ar_print_stats("imported", &st);
+    return 0;
+}
+
+static int cmd_to_archive(int argc, char **argv)
+{
+    args a;
+    const char *o, *at = NULL;
+    jfs_archive_opts ao;
+    jfs_archive_stats st;
+    jfs_fs *fs;
+    char err[1024];
+    int force = 0, rc;
+    jfs_archive_opts_init(&ao);
+    ao.warn = ar_warn;
+    args_init(&a, argc, argv);
+    while ((o = args_next(&a))) {
+        if (is(o, "-F", "--format"))
+            ao.format = args_value(&a, o);
+        else if (is(o, NULL, "--backend"))
+            ao.backend = parse_backend(args_value(&a, o));
+        else if (is(o, "-t", "--at"))
+            at = args_value(&a, o);
+        else if (is(o, NULL, "--pax"))
+            ao.pax = 1;
+        else if (is(o, NULL, "--zip64"))
+            ao.zip64 = 1;
+        else if (is(o, "-l", "--level"))
+            ao.level = atoi(args_value(&a, o));
+        else if (is(o, "-f", "--force"))
+            force = 1;
+        else
+            die("to-archive: unknown option %s", o);
+    }
+    if (a.npos < 2 || a.npos > 3)
+        die("usage: jsonfs to-archive [-F FORMAT] [--at TIME] [--pax] [--zip64] [-l LEVEL] [-f]\n"
+            "                         [--backend B] IMAGE ARCHIVE [IMAGE_DIR]");
+    if (!force && jfs_file_exists(a.pos[1]))
+        die("%s already exists (use -f to overwrite)", a.pos[1]);
+    open_ro(a.pos[0], at, &fs);
+    rc = jfs_archive_export(fs, a.npos == 3 ? a.pos[2] : "/", a.pos[1], &ao, &st, err, sizeof err);
+    jfs_close(fs);
+    if (rc) {
+        fprintf(stderr, "%s: %s\n", prog, err[0] ? err : jfs_strerror(rc));
+        return 1;
+    }
+    ar_print_stats("archived", &st);
+    return 0;
+}
+
+/* Is `path` a JSONfs image (or a URL, which can only be an image here)? */
+static int looks_like_image(const char *path)
+{
+    FILE *f;
+    char buf[1024];
+    size_t n;
+    if (jfs_is_url(path))
+        return 1;
+    f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    return strstr(buf, "\"format\"") && strstr(buf, "\"jsonfs\"") && buf[strspn(buf, " \t\r\n")] == '{';
+}
+
+static int cmd_convert(int argc, char **argv)
+{
+    int i, npos = 0;
+    const char *pos[2] = {NULL, NULL};
+    /* the first two positional arguments decide the direction */
+    for (i = 0; i < argc && npos < 2; i++) {
+        if (argv[i][0] == '-') {
+            if (!strcmp(argv[i], "-F") || !strcmp(argv[i], "--format") || !strcmp(argv[i], "--backend") ||
+                !strcmp(argv[i], "-t") || !strcmp(argv[i], "--at") || !strcmp(argv[i], "-L") ||
+                !strcmp(argv[i], "--label") || !strcmp(argv[i], "-c") || !strcmp(argv[i], "--compression") ||
+                !strcmp(argv[i], "-l") || !strcmp(argv[i], "--level") || !strcmp(argv[i], "-i") ||
+                !strcmp(argv[i], "--into"))
+                i++;
+            continue;
+        }
+        pos[npos++] = argv[i];
+    }
+    if (npos != 2)
+        die("usage: jsonfs convert [options] SOURCE DESTINATION\n"
+            "  archive -> image: jsonfs convert photos.zip photos.json\n"
+            "  image -> archive: jsonfs convert photos.json photos.tar.gz");
+    if (looks_like_image(pos[0]))
+        return cmd_to_archive(argc, argv);
+    return cmd_from_archive(argc, argv);
+}
+
+static void print_line(void *cookie, const char *line)
+{
+    (void)cookie;
+    printf("%s\n", line);
+}
+
 #ifdef _WIN32
 /* Installer helper: add/remove a directory to/from the machine PATH without
  * the 1024 character limit of NSIS strings. */
@@ -1199,6 +1937,23 @@ static void usage(FILE *f)
             "  log [--at TIME] IMAGE PATH       list the versions of a file\n"
             "  prune --before TIME IMAGE        drop history older than TIME\n"
             "\n"
+            "Folders <-> images:\n"
+            "  pack [-L label] [-c algo] [-V] [-f] FOLDER IMAGE   create IMAGE from FOLDER\n"
+            "  unpack [--at TIME] [-f] IMAGE FOLDER              extract IMAGE into FOLDER\n"
+            "\n"
+            "Archives (zip, tar, tar.gz built in; 7z, tar.xz, tar.bz2, tar.zst, ... via libarchive):\n"
+            "  convert SOURCE DEST                     archive -> image or image -> archive\n"
+            "  from-archive [-F fmt] [mkfs opts] [--into PATH] ARCHIVE IMAGE\n"
+            "  to-archive [-F fmt] [--at TIME] [--pax] IMAGE ARCHIVE [IMAGE_DIR]\n"
+            "  archive-formats                         list supported formats\n"
+            "\n"
+            "Editing without mounting:\n"
+            "  add [-f] [-p] IMAGE HOST_PATH... DEST   add files/folders (like cp -r)\n"
+            "  mv [-n] IMAGE SOURCE... DEST            rename / move inside the image\n"
+            "  get [--at TIME] [-f] IMAGE PATH [HOST_DEST]   extract a file or folder\n"
+            "  rm [-r] [-f] IMAGE PATH...              remove files / folders\n"
+            "  mkdir [-p] [-m MODE] IMAGE PATH...      create directories\n"
+            "\n"
             "Content access (works without mounting):\n"
             "  ls [-l] [-a] [-R] [--at TIME] IMAGE [PATH]\n"
             "  cat [--at TIME] IMAGE PATH...\n"
@@ -1282,6 +2037,30 @@ int main(int argc, char **argv)
         return cmd_ls(argc, argv);
     if (!strcmp(cmd, "cat"))
         return cmd_cat(argc, argv);
+    if (!strcmp(cmd, "from-archive") || !strcmp(cmd, "import-archive"))
+        return cmd_from_archive(argc, argv);
+    if (!strcmp(cmd, "to-archive") || !strcmp(cmd, "export-archive"))
+        return cmd_to_archive(argc, argv);
+    if (!strcmp(cmd, "convert"))
+        return cmd_convert(argc, argv);
+    if (!strcmp(cmd, "archive-formats")) {
+        jfs_archive_list_formats(print_line, NULL);
+        return 0;
+    }
+    if (!strcmp(cmd, "pack") || !strcmp(cmd, "create") || !strcmp(cmd, "from-dir"))
+        return cmd_pack(argc, argv);
+    if (!strcmp(cmd, "unpack") || !strcmp(cmd, "to-dir"))
+        return cmd_unpack(argc, argv);
+    if (!strcmp(cmd, "add") || !strcmp(cmd, "put"))
+        return cmd_add(argc, argv);
+    if (!strcmp(cmd, "mv") || !strcmp(cmd, "rename"))
+        return cmd_mv(argc, argv);
+    if (!strcmp(cmd, "rm") || !strcmp(cmd, "remove"))
+        return cmd_rm(argc, argv);
+    if (!strcmp(cmd, "mkdir"))
+        return cmd_mkdir(argc, argv);
+    if (!strcmp(cmd, "get") || !strcmp(cmd, "extract-file"))
+        return cmd_get(argc, argv);
     if (!strcmp(cmd, "import"))
         return cmd_import(argc, argv);
     if (!strcmp(cmd, "export"))

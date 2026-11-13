@@ -157,7 +157,53 @@ static int winfsp_load(char *why, size_t whylen)
     LOAD(fsp_fuse_get_context);
     LOAD(fsp_fuse_signal_handler);
 #undef LOAD
+    {
+        /* optional: change notifications (WinFsp 2017+) */
+        FARPROC fp = GetProcAddress(winfsp_dll, "fsp_fuse_notify");
+        memcpy(&pfn_fsp_fuse_notify, &fp, sizeof fp);
+    }
     return 1;
+}
+
+static struct fuse *win_fuse;
+
+static void winfsp_notify(const jfs_changes *ch)
+{
+    size_t i;
+    if (!win_fuse || !pfn_fsp_fuse_notify)
+        return;
+    for (i = 0; i < ch->n; i++) {
+        const jfs_change *c = &ch->v[i];
+        int dir = (c->mode & JFS_S_IFMT) == JFS_S_IFDIR;
+        switch (c->kind) {
+        case JFS_CHANGE_CREATE:
+        case JFS_CHANGE_LINK:
+            fuse_notify(win_fuse, c->path, dir ? FSP_FUSE_NOTIFY_MKDIR : FSP_FUSE_NOTIFY_CREATE);
+            break;
+        case JFS_CHANGE_DELETE:
+            fuse_notify(win_fuse, c->path, dir ? FSP_FUSE_NOTIFY_RMDIR : FSP_FUSE_NOTIFY_UNLINK);
+            break;
+        case JFS_CHANGE_RENAME:
+            fuse_notify(win_fuse, c->path, dir ? FSP_FUSE_NOTIFY_RMDIR : FSP_FUSE_NOTIFY_UNLINK);
+            fuse_notify(win_fuse, c->path2, dir ? FSP_FUSE_NOTIFY_MKDIR : FSP_FUSE_NOTIFY_CREATE);
+            break;
+        case JFS_CHANGE_MODIFY:
+            fuse_notify(win_fuse, c->path, FSP_FUSE_NOTIFY_TRUNCATE | FSP_FUSE_NOTIFY_UTIME);
+            break;
+        case JFS_CHANGE_ATTRIB:
+            fuse_notify(win_fuse, c->path, FSP_FUSE_NOTIFY_CHMOD | FSP_FUSE_NOTIFY_CHOWN | FSP_FUSE_NOTIFY_UTIME);
+            break;
+        }
+    }
+}
+
+static void winfsp_capture_fuse(void)
+{
+    struct fuse_context *fc = fuse_get_context();
+    if (fc)
+        win_fuse = fc->fuse;
+    if (pfn_fsp_fuse_notify)
+        jfs_refresh_notify_hook = winfsp_notify;
 }
 
 static struct fuse_context *ctx_get(void)
@@ -504,6 +550,19 @@ static int c_getattr(const char *path, jstat_t *st, uint64_t fh, int has_fh)
     return E(rc);
 }
 
+/* one of the system calls our refresher issues to replay remote changes? */
+static int is_replay(void)
+{
+    struct fuse_context *fc = ctx_get();
+    return fc && jfs_refresh_is_replay((uint64_t)fc->pid);
+}
+
+static uint64_t caller_pid(void)
+{
+    struct fuse_context *fc = ctx_get();
+    return fc ? (uint64_t)fc->pid : 0;
+}
+
 static int c_readlink(const char *path, char *buf, size_t size)
 {
     return E(jfs_readlink(jfs_mount_fs, path, buf, size));
@@ -512,28 +571,38 @@ static int c_readlink(const char *path, char *buf, size_t size)
 static int c_mknod(const char *path, jmode_t mode, jdev_t rdev)
 {
     jfs_ctx c = caller();
+    if (is_replay())
+        return E(jfs_replay_create(jfs_mount_fs, path));
     return E(jfs_mknod(jfs_mount_fs, path, (uint32_t)mode, (uint64_t)rdev, &c));
 }
 
 static int c_mkdir(const char *path, jmode_t mode)
 {
     jfs_ctx c = caller();
+    if (is_replay())
+        return E(jfs_replay_create(jfs_mount_fs, path));
     return E(jfs_mkdir(jfs_mount_fs, path, (uint32_t)mode, &c));
 }
 
 static int c_unlink(const char *path)
 {
+    if (is_replay())
+        return E(jfs_replay_remove(jfs_mount_fs, path));
     return E(jfs_unlink(jfs_mount_fs, path));
 }
 
 static int c_rmdir(const char *path)
 {
+    if (is_replay())
+        return E(jfs_replay_remove(jfs_mount_fs, path));
     return E(jfs_rmdir(jfs_mount_fs, path));
 }
 
 static int c_symlink(const char *target, const char *path)
 {
     jfs_ctx c = caller();
+    if (is_replay())
+        return E(jfs_replay_create(jfs_mount_fs, path));
     return E(jfs_symlink(jfs_mount_fs, target, path, &c));
 }
 
@@ -546,21 +615,29 @@ static int c_rename(const char *from, const char *to, unsigned flags)
         jf |= JFS_RENAME_EXCHANGE;
     if (flags & ~3u)
         return -EINVAL;
+    if (is_replay())
+        return E(jfs_replay_rename(jfs_mount_fs, from, to));
     return E(jfs_rename(jfs_mount_fs, from, to, jf));
 }
 
 static int c_link(const char *from, const char *to)
 {
+    if (is_replay())
+        return E(jfs_replay_link(jfs_mount_fs, from, to));
     return E(jfs_link(jfs_mount_fs, from, to));
 }
 
 static int c_chmod(const char *path, jmode_t mode)
 {
+    if (is_replay())
+        return E(jfs_replay_update(jfs_mount_fs, path));
     return E(jfs_chmod(jfs_mount_fs, path, (uint32_t)mode));
 }
 
 static int c_chown(const char *path, juid_t uid, jgid_t gid)
 {
+    if (is_replay())
+        return E(jfs_replay_update(jfs_mount_fs, path));
     return E(jfs_chown(jfs_mount_fs, path, (uint32_t)uid, (uint32_t)gid));
 }
 
@@ -568,6 +645,8 @@ static int c_truncate(const char *path, joff_t size, uint64_t fh, int has_fh)
 {
     if (size < 0)
         return -EINVAL;
+    if (is_replay())
+        return E(has_fh && fh ? jfs_replay_update_handle(jfs_mount_fs, H(fh)) : jfs_replay_update(jfs_mount_fs, path));
     if (has_fh && fh)
         return E(jfs_ftruncate(jfs_mount_fs, H(fh), (uint64_t)size));
     return E(jfs_truncate(jfs_mount_fs, path, (uint64_t)size));
@@ -576,7 +655,16 @@ static int c_truncate(const char *path, joff_t size, uint64_t fh, int has_fh)
 static int c_open(const char *path, int flags, uint64_t *fh)
 {
     jfs_handle *h;
-    int rc = jfs_open_file(jfs_mount_fs, path, open_flags(flags), &h);
+    int rc;
+    if (is_replay()) {
+        /* replayed open-for-write of a read-only web image (content update) */
+        rc = jfs_open_file(jfs_mount_fs, path, JFS_O_RDONLY, &h);
+        if (!rc)
+            *fh = (uint64_t)(uintptr_t)h;
+        return E(rc);
+    }
+    jfs_refresh_on_access(caller_pid()); /* strict refresh mode */
+    rc = jfs_open_file(jfs_mount_fs, path, open_flags(flags), &h);
     if (!rc)
         *fh = (uint64_t)(uintptr_t)h;
     return E(rc);
@@ -586,7 +674,16 @@ static int c_create(const char *path, jmode_t mode, int flags, uint64_t *fh)
 {
     jfs_handle *h;
     jfs_ctx c = caller();
-    int rc = jfs_create(jfs_mount_fs, path, (uint32_t)mode, open_flags(flags) & ~JFS_O_TRUNC, &c, &h);
+    int rc;
+    if (is_replay()) {
+        rc = jfs_replay_create(jfs_mount_fs, path);
+        if (!rc)
+            rc = jfs_open_file(jfs_mount_fs, path, JFS_O_RDONLY, &h);
+        if (!rc)
+            *fh = (uint64_t)(uintptr_t)h;
+        return E(rc);
+    }
+    rc = jfs_create(jfs_mount_fs, path, (uint32_t)mode, open_flags(flags) & ~JFS_O_TRUNC, &c, &h);
     if (!rc)
         *fh = (uint64_t)(uintptr_t)h;
     return E(rc);
@@ -703,6 +800,8 @@ static int c_access(const char *path, int mask)
 static int c_utimens(const char *path, const jtimespec_t tv[2])
 {
     jfs_time t[2];
+    if (is_replay())
+        return E(jfs_replay_update(jfs_mount_fs, path));
     if (!tv)
         return E(jfs_utimens(jfs_mount_fs, path, NULL));
     t[0] = from_ts(&tv[0]);
@@ -713,6 +812,10 @@ static int c_utimens(const char *path, const jtimespec_t tv[2])
 static void *c_init(void)
 {
     jfs_start_committer(jfs_mount_fs);
+#ifdef _WIN32
+    winfsp_capture_fuse();
+#endif
+    jfs_refresh_start();
     jfs_mount_signal_ready();
     return NULL;
 }
@@ -722,6 +825,7 @@ static void c_destroy(void)
     int rc;
     if (!jfs_mount_fs)
         return;
+    jfs_refresh_stop();
     rc = jfs_close(jfs_mount_fs);
     if (rc)
         jfs_log("final commit failed: %s", jfs_strerror(rc));
@@ -763,7 +867,7 @@ static int f2_statfs(const char *p, jstatvfs_t *sv) { (void)p; return c_statfs(s
 static int f2_flush(const char *p, jfi2_t *fi) { (void)p; return c_flush(fi->fh); }
 static int f2_release(const char *p, jfi2_t *fi) { (void)p; return c_release(fi->fh); }
 static int f2_fsync(const char *p, int d, jfi2_t *fi) { (void)p; (void)d; return c_fsync(fi->fh); }
-static int f2_opendir(const char *p, jfi2_t *fi) { (void)p; (void)fi; return 0; }
+static int f2_opendir(const char *p, jfi2_t *fi) { (void)p; (void)fi; jfs_refresh_on_access(caller_pid()); return 0; }
 static int f2_releasedir(const char *p, jfi2_t *fi) { (void)p; (void)fi; return 0; }
 static int f2_fsyncdir(const char *p, int d, jfi2_t *fi) { (void)p; (void)d; (void)fi; return E(jfs_sync(jfs_mount_fs)); }
 static void *f2_init(struct fuse_conn_info *c) { (void)c; return c_init(); }
@@ -814,7 +918,7 @@ static int f3_statfs(const char *p, struct statvfs *sv) { (void)p; return c_stat
 static int f3_flush(const char *p, jfi3_t *fi) { (void)p; return c_flush(fi->fh); }
 static int f3_release(const char *p, jfi3_t *fi) { (void)p; return c_release(fi->fh); }
 static int f3_fsync(const char *p, int d, jfi3_t *fi) { (void)p; (void)d; return c_fsync(fi->fh); }
-static int f3_opendir(const char *p, jfi3_t *fi) { (void)p; (void)fi; return 0; }
+static int f3_opendir(const char *p, jfi3_t *fi) { (void)p; (void)fi; jfs_refresh_on_access(caller_pid()); return 0; }
 static int f3_releasedir(const char *p, jfi3_t *fi) { (void)p; (void)fi; return 0; }
 static int f3_fsyncdir(const char *p, int d, jfi3_t *fi) { (void)p; (void)d; (void)fi; return E(jfs_sync(jfs_mount_fs)); }
 static void *f3_init(struct fuse_conn_info *c, struct jfuse_config3 *cfg)
@@ -907,11 +1011,22 @@ int jfs_fuse_run(void)
 {
     char **argv = NULL, *opts;
     int argc = 0, rc;
+    int web_events = 0, allow_other = 0;
+    (void)web_events;
+    (void)allow_other;
     jfs_buf o;
     jfs_info info;
 
     jfs_get_info(jfs_mount_fs, &info);
     jfs_buf_init(&o);
+#ifndef _WIN32
+    {
+        const char *pt = jfs_mount_cfg.passthrough ? jfs_mount_cfg.passthrough : "";
+        allow_other = strstr(pt, "allow_other") != NULL;
+        web_events = jfs_is_remote(jfs_mount_fs) && jfs_mount_cfg.events && !jfs_mount_cfg.single_thread &&
+                     jfs_mount_cfg.refresh_mode != JFS_REFRESH_OFF;
+    }
+#endif
 #ifdef _WIN32
     jfs_buf_printf(&o, "uid=-1,gid=-1,FileSystemName=JSONFS,volname=%s",
                    jfs_mount_cfg.volname ? jfs_mount_cfg.volname : (info.label[0] ? info.label : "JSONfs"));
@@ -929,7 +1044,11 @@ int jfs_fuse_run(void)
                 *q = '_';
         /* attr_timeout=0: the high-level FUSE API gives every hard link its own
          * kernel inode, so cached attributes could go stale across links */
-        jfs_buf_printf(&o, "fsname=%s,default_permissions,attr_timeout=0", fsn);
+        /* web images that propagate remote changes are mounted rw at the kernel
+         * level (the volume itself refuses writes) so that replayed changes
+         * can pass; the volume is private to the mounting user, and permission
+         * checks are left to the kernel only when it is shared (allow_other) */
+        jfs_buf_printf(&o, "fsname=%s%s,attr_timeout=0", fsn, web_events && !allow_other ? "" : ",default_permissions");
         free(fsn);
     }
 #if defined(__linux__) || defined(__FreeBSD__)
@@ -941,7 +1060,7 @@ int jfs_fuse_run(void)
 #endif
     if (fuse_major == 2)
         jfs_buf_puts(&o, ",use_ino,hard_remove");
-    if (jfs_mount_cfg.readonly)
+    if (jfs_mount_cfg.readonly && !web_events)
         jfs_buf_puts(&o, ",ro");
     if (jfs_mount_cfg.shared)
         jfs_buf_puts(&o, ",entry_timeout=0,negative_timeout=0");

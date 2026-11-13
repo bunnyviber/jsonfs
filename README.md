@@ -43,6 +43,18 @@ jsonfs ls -l notes.json                   # or read it without mounting
   mounts a published image read-only. Certificates are verified by default
   (`--insecure` to skip, `--cacert` for private CAs); plain `http://` works
   too and never follows redirects.
+* **Live web mounts**: remote updates are picked up automatically
+  (eventually consistent, or `refresh=strict` to check on every open and
+  directory listing) using `304`/ETag revalidation or 4 KiB header probes -
+  the full image is only fetched when it changed; the last good version stays
+  mounted when the server fails; optional on-disk cache for offline mounts.
+* **File system events** (inotify, kqueue/FSEvents, ReadDirectoryChangesW)
+  for local changes *and* for remote updates of web mounts.
+* **Archive conversion**: `jsonfs convert photos.zip photos.json` and back;
+  zip, tar and tar.gz built in, 7z / tar.xz / tar.bz2 / tar.zst / cpio / iso
+  / rar (read) … through libarchive when installed.
+* **Folder ↔ image tools**: `jsonfs pack` / `unpack`, plus `add`, `mv`, `get`,
+  `rm`, `mkdir` to edit images without mounting.
 * **Crash safety** – commits are atomic (write temp file, fsync, rename).
 * **Offline maintenance toolkit** (`jsonfs`): `fsck` (verifies every
   checksum, including history; repairs structure), `snapshot` (extract the

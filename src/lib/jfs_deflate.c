@@ -37,12 +37,31 @@ typedef struct inflate_state {
     int bitcnt;
     uint8_t *out;
     size_t outlen, outpos;
+    int grow; /* output buffer may be reallocated (jfs_inflate_alloc) */
 } inflate_state;
 
 typedef struct huff {
     uint16_t count[16];
     uint16_t symbol[288];
 } huff;
+
+/* Is there room for n more output bytes?  Grows the buffer when allowed. */
+static int out_room(inflate_state *s, size_t n)
+{
+    size_t need = s->outpos + n, nc;
+    if (need < s->outpos)
+        return 0;
+    if (need <= s->outlen)
+        return 1;
+    if (!s->grow || need > (((size_t)-1) >> 2))
+        return 0;
+    nc = s->outlen ? s->outlen : 65536;
+    while (nc < need)
+        nc *= 2;
+    s->out = jfs_realloc(s->out, nc);
+    s->outlen = nc;
+    return 1;
+}
 
 static int getbits(inflate_state *s, int need, uint32_t *val)
 {
@@ -112,7 +131,7 @@ static int inflate_codes(inflate_state *s, const huff *lencode, const huff *dist
         if (sym < 0)
             return -1;
         if (sym < 256) {
-            if (s->outpos >= s->outlen)
+            if (!out_room(s, 1))
                 return -1;
             s->out[s->outpos++] = (uint8_t)sym;
         } else if (sym == 256) {
@@ -132,7 +151,7 @@ static int inflate_codes(inflate_state *s, const huff *lencode, const huff *dist
             if (getbits(s, dist_extra[sym], &e))
                 return -1;
             dist = dist_base[sym] + e;
-            if (dist > s->outpos || s->outpos + len > s->outlen)
+            if (dist > s->outpos || !out_room(s, len))
                 return -1;
             for (k = 0; k < len; k++) {
                 s->out[s->outpos] = s->out[s->outpos - dist];
@@ -153,7 +172,7 @@ static int inflate_stored(inflate_state *s)
     if ((s->in[s->inpos + 2] != (uint8_t)~s->in[s->inpos]) || (s->in[s->inpos + 3] != (uint8_t)~s->in[s->inpos + 1]))
         return -1;
     s->inpos += 4;
-    if (s->inpos + len > s->inlen || s->outpos + len > s->outlen)
+    if (s->inpos + len > s->inlen || !out_room(s, len))
         return -1;
     memcpy(s->out + s->outpos, s->in + s->inpos, len);
     s->inpos += len;
@@ -248,6 +267,49 @@ static int inflate_dynamic(inflate_state *s)
     if (err < 0 || (err > 0 && ndist - distcode.count[0] != 1))
         return -1;
     return inflate_codes(s, &lencode, &distcode);
+}
+
+static int inflate_run(inflate_state *s)
+{
+    uint32_t last, type;
+    do {
+        int rc;
+        if (getbits(s, 1, &last) || getbits(s, 2, &type))
+            return -JFS_ECORRUPT;
+        if (type == 0)
+            rc = inflate_stored(s);
+        else if (type == 1)
+            rc = inflate_fixed(s);
+        else if (type == 2)
+            rc = inflate_dynamic(s);
+        else
+            rc = -1;
+        if (rc)
+            return -JFS_ECORRUPT;
+    } while (!last);
+    return 0;
+}
+
+int jfs_inflate_alloc(const uint8_t *in, size_t n, uint8_t **out, size_t *outlen, size_t *consumed)
+{
+    inflate_state s;
+    int rc;
+    memset(&s, 0, sizeof s);
+    s.in = in;
+    s.inlen = n;
+    s.grow = 1;
+    s.outlen = n * 3 + 1024;
+    s.out = jfs_malloc(s.outlen);
+    rc = inflate_run(&s);
+    if (rc) {
+        free(s.out);
+        return rc;
+    }
+    *out = s.out;
+    *outlen = s.outpos;
+    if (consumed)
+        *consumed = s.inpos; /* the final partial byte belongs to the stream */
+    return 0;
 }
 
 int jfs_deflate_decompress(const uint8_t *in, size_t n, uint8_t *out, size_t expected)

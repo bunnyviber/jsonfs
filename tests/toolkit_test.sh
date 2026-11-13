@@ -133,6 +133,48 @@ grep -q "0 error(s), 0 warning(s)" out || bad "upgraded image is clean"
 # ---- prune ---------------------------------------------------------------------
 run "prune" "$J" prune --before now img.json
 
+# ---- pack / unpack / add / mv / get / rm / mkdir ------------------------------------
+run "pack" "$J" pack -c lz4 -L packed src packed.json
+fails "pack refuses to overwrite" "$J" pack src packed.json
+fails "pack needs a folder" "$J" pack src/hello.txt p2.json
+run "unpack" "$J" unpack packed.json unpacked
+run "pack/unpack round trip" diff -r src unpacked
+expect "unpack keeps symlinks" "hello.txt" "$(readlink unpacked/link)"
+fails "unpack refuses a non-empty folder" "$J" unpack packed.json unpacked
+run "unpack -f" "$J" unpack -f packed.json unpacked
+printf 'added\n' >added.txt
+run "add file" "$J" add packed.json added.txt /
+fails "add refuses to overwrite" "$J" add packed.json added.txt /added.txt
+grep -q "image left unchanged" out || bad "failed add leaves the image unchanged"
+printf 'replaced\n' >added.txt
+run "add -f replaces" "$J" add -f packed.json added.txt /added.txt
+run "cat added" "$J" cat packed.json /added.txt
+expect "replaced content" "replaced" "$(cat out)"
+run "add -p into new folders" "$J" add -p packed.json added.txt src/sub /new/deep/
+run "added tree" "$J" ls -R packed.json /new/deep
+grep -q "random.bin" out || bad "add copies folders recursively"
+run "mv rename" "$J" mv packed.json /added.txt /renamed.txt
+run "mv into folder" "$J" mv packed.json /renamed.txt /hello.txt /new
+run "ls after mv" "$J" ls packed.json /new
+grep -q "renamed.txt" out || bad "mv moved file into folder"
+fails "mv -n refuses to clobber" "$J" mv -n packed.json /new/renamed.txt /new/hello.txt
+fails "mv missing source" "$J" mv packed.json /nope /x
+run "get file" "$J" get packed.json /new/renamed.txt got.txt
+expect "get content" "replaced" "$(cat got.txt)"
+fails "get refuses to overwrite" "$J" get packed.json /new/renamed.txt got.txt
+run "get folder" "$J" get packed.json /new/deep gotdir
+run "get folder content" diff -r src/sub gotdir/sub
+fails "rm folder without -r" "$J" rm packed.json /new
+run "rm -r" "$J" rm -r packed.json /new
+fails "rm missing" "$J" rm packed.json /new
+run "rm -f missing" "$J" rm -f packed.json /new
+fails "rm root" "$J" rm -r packed.json /
+run "mkdir -p" "$J" mkdir -p -m 0700 packed.json /m/n/o
+run "ls mkdir" "$J" ls -l packed.json /m/n
+grep -q "drwx------" out || bad "mkdir -m sets the mode"
+run "fsck after edits" "$J" fsck packed.json
+grep -q "0 error(s), 0 warning(s)" out || bad "edited image is clean"
+
 # ---- compressors / version ---------------------------------------------------------
 run "compressors" "$J" compressors
 run "version" "$J" version

@@ -20,7 +20,7 @@
 #define JFS_WINDOWS 1
 #endif
 
-#define JFS_VERSION_STRING "1.1.0"
+#define JFS_VERSION_STRING "1.3.0"
 #define JFS_WIDEN2_(x) L##x
 #define JFS_WIDEN_(x) JFS_WIDEN2_(x)
 #define JFS_VERSION_WIDE JFS_WIDEN_(JFS_VERSION_STRING)

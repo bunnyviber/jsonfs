@@ -100,6 +100,78 @@ void jfs_inode_free(jfs_inode *in)
     free(in);
 }
 
+void jfs_inode_copy_state(jfs_inode *dst, const jfs_inode *src)
+{
+    size_t i;
+    dst->type = src->type;
+    dst->mode = src->mode;
+    dst->uid = src->uid;
+    dst->gid = src->gid;
+    dst->rdev = src->rdev;
+    dst->atime = src->atime;
+    dst->mtime = src->mtime;
+    dst->ctime = src->ctime;
+    dst->btime = src->btime;
+    dst->vtime = src->vtime;
+    if (src->type == JFS_T_FILE) {
+        free(dst->comp);
+        free(dst->blob);
+        free(dst->data);
+        dst->comp = src->comp ? jfs_strdup(src->comp) : NULL;
+        dst->blob = src->blob ? jfs_strndup(src->blob, src->blob_len) : NULL;
+        dst->blob_len = src->blob_len;
+        dst->size = src->size;
+        memcpy(dst->sha, src->sha, 32);
+        dst->sha_valid = src->sha_valid;
+        dst->data = NULL;
+        dst->data_cap = 0;
+        dst->data_loaded = 0;
+        dst->data_dirty = 0;
+        if (src->data_loaded && (src->data_dirty || !src->blob)) {
+            dst->data = jfs_malloc((size_t)src->size + 1);
+            memcpy(dst->data, src->data, (size_t)src->size);
+            dst->data_cap = (size_t)src->size + 1;
+            dst->data_loaded = 1;
+            dst->data_dirty = src->data_dirty;
+        }
+    } else {
+        dst->size = src->size;
+    }
+    free(dst->target);
+    dst->target = src->target ? jfs_strdup(src->target) : NULL;
+    for (i = 0; i < dst->nxattrs; i++) {
+        free(dst->xattrs[i].name);
+        free(dst->xattrs[i].val);
+    }
+    free(dst->xattrs);
+    dst->xattrs = NULL;
+    dst->nxattrs = 0;
+    if (src->nxattrs) {
+        dst->xattrs = jfs_calloc(src->nxattrs, sizeof(jfs_xattr));
+        for (i = 0; i < src->nxattrs; i++) {
+            dst->xattrs[i].name = jfs_strdup(src->xattrs[i].name);
+            dst->xattrs[i].val = jfs_malloc(src->xattrs[i].len ? src->xattrs[i].len : 1);
+            memcpy(dst->xattrs[i].val, src->xattrs[i].val, src->xattrs[i].len);
+            dst->xattrs[i].len = src->xattrs[i].len;
+        }
+        dst->nxattrs = src->nxattrs;
+    }
+}
+
+jfs_inode *jfs_inode_clone(const jfs_inode *src)
+{
+    jfs_inode *c = jfs_calloc(1, sizeof *c);
+    c->ino = src->ino;
+    jfs_inode_copy_state(c, src);
+    if (src->type == JFS_T_DIR) {
+        c->entries = jfs_calloc(1, sizeof(jfs_strmap));
+        jfs_strmap_init(c->entries);
+    }
+    c->persisted = 1;
+    c->version_open = 1;
+    return c;
+}
+
 static int parse_mode(const jv *v, uint32_t *mode)
 {
     if (!v)
@@ -410,6 +482,7 @@ int jfs_fs_create_empty(jfs_fs **out)
     jfs_fs *fs = jfs_calloc(1, sizeof *fs);
     jfs_u64map_init(&fs->inodes);
     jfs_mutex_init(&fs->mu);
+    jfs_mutex_init(&fs->remote_mu);
     fs->schema = JFS_SCHEMA_LATEST;
     fs->next_ino = 2;
     fs->root_ino = 1;
@@ -450,6 +523,10 @@ void jfs_fs_free(jfs_fs *fs)
     free(fs->default_comp);
     free(fs->write_comp);
     jfs_mutex_destroy(&fs->mu);
+    jfs_mutex_destroy(&fs->remote_mu);
+    free(fs->etag);
+    free(fs->last_modified);
+    free(fs->cache_path);
     free(fs);
 }
 
@@ -1005,7 +1082,12 @@ int jfs_open(const char *image, const jfs_open_opts *o, jfs_fs **out, char *err,
     }
     if (fs->shared && fs->lock)
         jfs_lockfile_lock(fs->lock, JFS_LOCK_TXN, 0, 1);
-    rc = read_and_parse(image, &root, err, errlen);
+    if (jfs_is_url(image)) {
+        fs->cache_path = o->cache_path && *o->cache_path ? jfs_strdup(o->cache_path) : NULL;
+        rc = jfs_remote_initial_load(fs, image, &root, err, errlen);
+    } else {
+        rc = read_and_parse(image, &root, err, errlen);
+    }
     if (!rc && !jfs_is_url(image))
         jfs_file_signature(image, &fs->sig);
     if (fs->shared && fs->lock)
@@ -1116,47 +1198,27 @@ int jfs_close(jfs_fs *fs)
     return rc;
 }
 
+void jfs_abort(jfs_fs *fs)
+{
+    if (!fs)
+        return;
+    jfs_stop_committer(fs);
+    if (fs->lock)
+        jfs_lockfile_close(fs->lock, 0);
+    fs->lock = NULL;
+    jfs_fs_free(fs);
+}
+
 /* ======================================================================== */
 /* Multi-attach: reload when a peer committed                                 */
 /* ======================================================================== */
-int jfs_maybe_reload(jfs_fs *fs)
+/* Replace the state of `fs` with the freshly loaded `tmp` (which is freed),
+ * re-attaching open handles: handles of files that no longer exist keep
+ * their old inode alive as an orphan until closed. */
+void jfs_install_loaded(jfs_fs *fs, jfs_fs *tmp)
 {
-    uint64_t gen = 0;
-    jfs_filesig sig;
-    jfs_fs *tmp;
-    jv *root;
-    char err[256];
-    int rc;
     size_t i;
     jfs_handle *h;
-    int changed = fs->need_reload;
-
-    if (!fs->shared)
-        return 0;
-    if (!changed && fs->lock && jfs_lockfile_read_gen(fs->lock, &gen, NULL) == 0 && gen != fs->generation)
-        changed = 1;
-    if (!changed && jfs_file_signature(fs->image_path, &sig) == 0 && !jfs_filesig_equal(&sig, &fs->sig))
-        changed = 1;
-    if (!changed)
-        return 0;
-
-    rc = read_and_parse(fs->image_path, &root, err, sizeof err);
-    if (rc) {
-        jfs_log("reload failed: %s", err);
-        return -JFS_EIO;
-    }
-    jfs_fs_create_empty(&tmp);
-    tmp->image_path = jfs_strdup(fs->image_path);
-    rc = jfs_fs_load_json(tmp, root, NULL, err, sizeof err);
-    jv_free(root);
-    if (rc) {
-        jfs_log("reload failed: %s", err);
-        jfs_fs_free(tmp);
-        return -JFS_EIO;
-    }
-    JFS_DEBUG("reloading %s: generation %llu -> %llu", fs->image_path, (unsigned long long)fs->generation,
-              (unsigned long long)tmp->generation);
-
     /* swap state: fs gets the fresh image, tmp keeps the old inodes */
     {
         jfs_u64map m = fs->inodes;
@@ -1228,6 +1290,45 @@ int jfs_maybe_reload(jfs_fs *fs)
         if (tmp->inodes.vals[i])
             ((jfs_inode *)tmp->inodes.vals[i])->moved_to = NULL;
     jfs_fs_free(tmp);
+}
+
+int jfs_maybe_reload(jfs_fs *fs)
+{
+    uint64_t gen = 0;
+    jfs_filesig sig;
+    jfs_fs *tmp;
+    jv *root;
+    char err[256];
+    int rc;
+    int changed = fs->need_reload;
+
+    if (!fs->shared)
+        return 0;
+    if (!changed && fs->lock && jfs_lockfile_read_gen(fs->lock, &gen, NULL) == 0 && gen != fs->generation)
+        changed = 1;
+    if (!changed && jfs_file_signature(fs->image_path, &sig) == 0 && !jfs_filesig_equal(&sig, &fs->sig))
+        changed = 1;
+    if (!changed)
+        return 0;
+
+    rc = read_and_parse(fs->image_path, &root, err, sizeof err);
+    if (rc) {
+        jfs_log("reload failed: %s", err);
+        return -JFS_EIO;
+    }
+    jfs_fs_create_empty(&tmp);
+    tmp->image_path = jfs_strdup(fs->image_path);
+    rc = jfs_fs_load_json(tmp, root, NULL, err, sizeof err);
+    jv_free(root);
+    if (rc) {
+        jfs_log("reload failed: %s", err);
+        jfs_fs_free(tmp);
+        return -JFS_EIO;
+    }
+    JFS_DEBUG("reloading %s: generation %llu -> %llu", fs->image_path, (unsigned long long)fs->generation,
+              (unsigned long long)tmp->generation);
+
+    jfs_install_loaded(fs, tmp);
     return 0;
 }
 

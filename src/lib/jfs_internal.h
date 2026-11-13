@@ -112,6 +112,14 @@ struct jfs_fs {
     volatile int committer_stop;
     jfs_time last_commit;
     int last_commit_error;
+
+    /* remote (http/https) images */
+    int is_remote;
+    char *etag, *last_modified; /* HTTP validators of the copy we serve */
+    char *cache_path;           /* optional on-disk copy (+ ".meta") */
+    jfs_remote_stats rstats;
+    jfs_mutex remote_mu;        /* serializes network checks */
+    jfs_fs *replay_target;      /* pending new state while changes are replayed */
 };
 
 /* jfs_image.c */
@@ -120,6 +128,10 @@ jfs_type jfs_type_from_name(const char *s);
 uint32_t jfs_type_mode_bits(jfs_type t);
 jfs_inode *jfs_inode_new(jfs_fs *fs, jfs_type t);
 void jfs_inode_free(jfs_inode *in);
+/* Deep copy without directory entries, history or decoded data. */
+jfs_inode *jfs_inode_clone(const jfs_inode *src);
+/* Copy metadata and content (not entries) from src to dst. */
+void jfs_inode_copy_state(jfs_inode *dst, const jfs_inode *src);
 jfs_inode *jfs_inode_from_record(jv *rec, uint64_t ino, int schema, int take, char *err, size_t errlen);
 jv *jfs_inode_to_record(jfs_fs *fs, jfs_inode *in);
 int jfs_inode_load_data(jfs_fs *fs, jfs_inode *in);
@@ -131,9 +143,13 @@ int jfs_fs_create_empty(jfs_fs **out);
 void jfs_fs_free(jfs_fs *fs);
 int jfs_fs_load_json(jfs_fs *fs, jv *root, const jfs_time *at, char *err, size_t errlen);
 int jfs_maybe_reload(jfs_fs *fs);
+void jfs_install_loaded(jfs_fs *fs, jfs_fs *tmp);
 void jfs_recount_links(jfs_fs *fs);
 void jfs_orphan_add(jfs_fs *fs, jfs_inode *in);
 void jfs_orphan_release(jfs_fs *fs, jfs_inode *in);
+
+/* jfs_remote.c */
+int jfs_remote_initial_load(jfs_fs *fs, const char *url, jv **root, char *err, size_t errlen);
 
 /* jfs_vfs.c */
 void jfs_version_touch(jfs_fs *fs, jfs_inode *in);

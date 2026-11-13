@@ -56,6 +56,16 @@ const jfs_compressor *jfs_compressor_list(size_t *count);
 /* Validate an algorithm specification of the form "name" or "name:level". */
 int jfs_compression_parse(const char *spec, const jfs_compressor **c, int *level);
 
+/* Raw DEFLATE helpers (also used for gzip and zip archives). */
+int jfs_deflate_compress(const uint8_t *in, size_t n, int level, uint8_t **out, size_t *outlen);
+/* Inflates a raw DEFLATE stream of unknown size; *consumed = input bytes used. */
+int jfs_inflate_alloc(const uint8_t *in, size_t n, uint8_t **out, size_t *outlen, size_t *consumed);
+/* CRC-32 (IEEE 802.3, as used by gzip and zip); pass 0 to start. */
+uint32_t jfs_crc32(uint32_t crc, const void *data, size_t n);
+/* gzip (RFC 1952): decodes all members; encodes one member. */
+int jfs_gzip_decode(const uint8_t *in, size_t n, uint8_t **out, size_t *outlen);
+int jfs_gzip_encode(const uint8_t *in, size_t n, int level, uint8_t **out, size_t *outlen);
+
 /* Convenience: compress + base64. */
 int jfs_encode_blob(const char *algo_spec, const uint8_t *data, size_t n, char **b64, size_t *b64len,
                     char **algo_name_out);

@@ -33,6 +33,25 @@ int jfs_http_insecure(void);
  * negative JFS error and a human readable message in err. */
 int jfs_http_get(const char *url, char **data, size_t *len, char *err, size_t errlen);
 
+/* Extended request: conditional GET, byte ranges, size limit, validators. */
+typedef struct jfs_http_req {
+    const char *if_none_match;     /* ETag from a previous response, or NULL */
+    const char *if_modified_since; /* Last-Modified from a previous response, or NULL */
+    uint64_t range_end;            /* >0: ask for bytes 0..range_end (Range header) */
+    size_t max_bytes;              /* >0: stop reading after this many bytes (not an error) */
+} jfs_http_req;
+
+typedef struct jfs_http_resp {
+    long status;          /* final HTTP status */
+    int not_modified;     /* 304: *data is empty, the previous copy is current */
+    int truncated;        /* max_bytes reached */
+    char etag[256];       /* validators of the response ("" if absent) */
+    char last_modified[128];
+} jfs_http_resp;
+
+int jfs_http_fetch(const char *url, const jfs_http_req *req, jfs_http_resp *resp, char **data, size_t *len,
+                   char *err, size_t errlen);
+
 /* Copies `url` into out with any user:password@ part replaced by "***@". */
 void jfs_url_redact(const char *url, char *out, size_t outlen);
 
