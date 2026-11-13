@@ -1,0 +1,95 @@
+name: release
+
+# Publishes a GitHub release with every build:
+#   - push a tag "vX.Y.Z", or
+#   - run this workflow manually (Actions -> release -> Run workflow); the tag
+#     defaults to v<VERSION from the Makefile> and is created on the selected commit.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (default: v<Makefile VERSION>)"
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark as pre-release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version and tag
+        id: v
+        run: |
+          version=$(sed -n 's/^VERSION *:= *//p' Makefile)
+          tag="${{ github.event.inputs.tag }}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then tag="${GITHUB_REF_NAME}"; fi
+          [ -n "$tag" ] || tag="v$version"
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::tag $tag does not match the Makefile VERSION $version"
+            exit 1
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+
+      - name: Toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 nsis zip fuse3 libfuse2t64
+          scripts/fetch-deps.sh all
+
+      - name: Test (native)
+        run: |
+          make -j4
+          mkdir -p /tmp/u && build/native/bin/jfs-unit-tests /tmp/u
+          sh tests/toolkit_test.sh "$PWD/build/native/bin/jsonfs"
+          sh tests/archive_test.sh "$PWD/build/native/bin/jsonfs"
+
+      - name: Build all targets and installers
+        run: scripts/build-release.sh all
+
+      - name: Release notes
+        run: |
+          v="${{ steps.v.outputs.version }}"
+          # section of CHANGELOG.md for this version
+          awk -v v="$v" '
+            /^## / { if (p) exit; if (index($0, "## " v " ") == 1 || $0 == "## " v) { p = 1; next } }
+            p' CHANGELOG.md >notes.md
+          {
+            echo
+            echo "## Downloads"
+            echo
+            echo "| platform | files |"
+            echo "|---|---|"
+            echo "| Windows XP - 11 (32/64 bit), Windows on ARM | \`*-windows-*-setup.exe\` (installer + uninstaller), \`*-windows-*.zip\` (portable) |"
+            echo "| Linux x86_64 / i686 / aarch64 / armv7 | \`*-linux-*.run\` (\`sudo sh FILE\` installs, \`... uninstall\` removes), \`*.tar.gz\` |"
+            echo "| macOS x86_64 / Apple Silicon | \`*-macos-*.run\`, \`*.tar.gz\` |"
+            echo "| FreeBSD x86_64 / aarch64 | \`*-freebsd-*.run\`, \`*.tar.gz\` |"
+            echo
+            echo "Mounting needs the platform's FUSE (libfuse 2/3, macFUSE or FUSE-T, fusefs) - or WinFsp"
+            echo "(Windows 7+) / Dokan 0.6 (XP, Vista). Checksums: \`SHA256SUMS\`."
+          } >>notes.md
+          cat notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.v.outputs.tag }}"
+          flags=""
+          [ "${{ github.event.inputs.prerelease }}" = "true" ] && flags="--prerelease"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --target "$GITHUB_SHA" \
+              --title "JSONfs ${{ steps.v.outputs.version }}" --notes-file notes.md $flags
+          fi
