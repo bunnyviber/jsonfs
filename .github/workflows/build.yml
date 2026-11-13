@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install FUSE
-        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse2t64
+        run: sudo apt-get update && sudo apt-get install -y fuse3 libfuse2t64 libarchive13t64 libarchive-tools zip unzip p7zip-full zstd
       - name: Build
         run: make -j4
       - name: Test (unit, toolkit, FUSE mounts)
@@ -31,6 +31,7 @@ jobs:
           make -j4 build/native/bin/jsonfs build/native/bin/jsonfs-mount build/native/bin/jfs-unit-tests
           mkdir -p /tmp/u && build/native/bin/jfs-unit-tests /tmp/u
           sh tests/toolkit_test.sh "$PWD/build/native/bin/jsonfs"
+          sh tests/archive_test.sh "$PWD/build/native/bin/jsonfs"
           sh tests/http_test.sh "$PWD/build/native/bin/jsonfs" "$PWD/build/native/bin/jsonfs-mount"
 
   release:

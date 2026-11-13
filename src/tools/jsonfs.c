@@ -19,6 +19,7 @@
 #include "../lib/jfs_codec.h"
 #include "../lib/jfs_fs.h"
 #include "../lib/jfs_http.h"
+#include "../lib/jfs_archive.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -40,6 +41,7 @@
 
 static const char *prog = "jsonfs";
 static int g_overwrite; /* add -f: replace existing non-directories */
+static int img_type(jfs_fs *fs, const char *path);
 
 static void die(const char *fmt, ...)
 {
@@ -804,7 +806,22 @@ static int import_tree(jfs_fs *fs, const char *host, const char *dst, uint64_t *
         if (rc)
             return rc;
     } else if (S_ISREG(st.st_mode)) {
+        /* keep hard links: the second name of an inode becomes a link */
+        static jfs_u64map seen_inodes;
+        uint64_t key = ((uint64_t)st.st_dev << 40) ^ (uint64_t)st.st_ino;
+        const char *first = st.st_nlink > 1 ? jfs_u64map_get(&seen_inodes, key) : NULL;
+        if (first && img_type(fs, first) == JFS_S_IFREG) {
+            if (g_overwrite && img_type(fs, dst))
+                jfs_unlink(fs, dst);
+            rc = jfs_link(fs, first, dst);
+            if (!rc) {
+                (*nfiles)++;
+                return 0; /* metadata is shared with the first name */
+            }
+        }
         rc = import_file_data(fs, host, dst, 0600, bytes);
+        if (!rc && st.st_nlink > 1)
+            jfs_u64map_put(&seen_inodes, key, jfs_strdup(dst));
     } else if (S_ISLNK(st.st_mode)) {
         char tgt[4096];
         ssize_t n = readlink(host, tgt, sizeof tgt - 1);
@@ -1599,6 +1616,216 @@ static int cmd_get(int argc, char **argv)
     return 0;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Archives (zip, tar, tar.gz built in; 7z, tar.xz, ... through libarchive)   */
+/* ------------------------------------------------------------------------ */
+static void ar_warn(void *cookie, const char *msg)
+{
+    (void)cookie;
+    fprintf(stderr, "%s: warning: %s\n", prog, msg);
+}
+
+static void ar_print_stats(const char *verb, const jfs_archive_stats *st)
+{
+    printf("%s %llu entries (%llu files, %llu directories, %llu symlinks, %llu hard links, %llu special), "
+           "%llu bytes [%s, %s]",
+           verb, (unsigned long long)st->entries, (unsigned long long)st->files, (unsigned long long)st->dirs,
+           (unsigned long long)st->symlinks, (unsigned long long)st->hardlinks, (unsigned long long)st->specials,
+           (unsigned long long)st->bytes, st->format, st->backend);
+    if (st->skipped)
+        printf(", %llu skipped", (unsigned long long)st->skipped);
+    printf("\n");
+}
+
+static int parse_backend(const char *v)
+{
+    if (!strcmp(v, "native") || !strcmp(v, "builtin"))
+        return JFS_AR_BACKEND_NATIVE;
+    if (!strcmp(v, "libarchive"))
+        return JFS_AR_BACKEND_LIBARCHIVE;
+    if (!strcmp(v, "auto"))
+        return JFS_AR_BACKEND_AUTO;
+    die("--backend must be auto, native or libarchive");
+    return 0;
+}
+
+static int cmd_from_archive(int argc, char **argv)
+{
+    args a;
+    const char *o, *into = NULL;
+    jfs_mkfs_opts mo;
+    jfs_archive_opts ao;
+    jfs_archive_stats st;
+    jfs_fs *fs;
+    char err[1024];
+    int force = 0, rc, created = 0;
+    memset(&mo, 0, sizeof mo);
+    jfs_archive_opts_init(&ao);
+    ao.warn = ar_warn;
+#ifndef _WIN32
+    ao.uid = (uint32_t)getuid();
+    ao.gid = (uint32_t)getgid();
+    ao.same_owner = getuid() == 0; /* like tar: keep owners only as root */
+#else
+    ao.same_owner = 0;
+#endif
+    args_init(&a, argc, argv);
+    while ((o = args_next(&a))) {
+        if (is(o, "-F", "--format"))
+            ao.format = args_value(&a, o);
+        else if (is(o, NULL, "--backend"))
+            ao.backend = parse_backend(args_value(&a, o));
+        else if (is(o, NULL, "--same-owner"))
+            ao.same_owner = 1;
+        else if (is(o, NULL, "--no-same-owner"))
+            ao.same_owner = 0;
+        else if (is(o, "-i", "--into"))
+            into = args_value(&a, o);
+        else if (is(o, "-L", "--label"))
+            mo.label = args_value(&a, o);
+        else if (is(o, "-c", "--compression"))
+            mo.compression = args_value(&a, o);
+        else if (is(o, "-V", "--versioning"))
+            mo.versioning = 1;
+        else if (is(o, "-f", "--force"))
+            force = 1;
+        else
+            die("from-archive: unknown option %s", o);
+    }
+    if (a.npos != 2)
+        die("usage: jsonfs from-archive [-F FORMAT] [-L label] [-c algo] [-V] [-f] [--into PATH]\n"
+            "                           [--same-owner|--no-same-owner] [--backend B] ARCHIVE IMAGE");
+    if (jfs_is_url(a.pos[1]))
+        die("cannot write an image at a URL");
+    if (!into) {
+        if (mo.compression && jfs_compression_parse(mo.compression, NULL, NULL))
+            die("unknown compression \"%s\"", mo.compression);
+        mo.root_uid = ao.uid;
+        mo.root_gid = ao.gid;
+        rc = jfs_mkfs(a.pos[1], &mo, force);
+        if (rc == -JFS_EEXIST)
+            die("%s already exists (use -f to overwrite, or --into PATH to add to it)", a.pos[1]);
+        if (rc)
+            return fail(rc, a.pos[1]);
+        created = 1;
+    }
+    open_rw(a.pos[1], &fs);
+    rc = jfs_archive_import(fs, a.pos[0], into ? into : "/", &ao, &st, err, sizeof err);
+    if (rc) {
+        jfs_abort(fs);
+        if (created) {
+            char lock[4200];
+            jfs_remove_file(a.pos[1]);
+            snprintf(lock, sizeof lock, "%s.lock", a.pos[1]);
+            jfs_remove_file(lock);
+        }
+        fprintf(stderr, "%s: %s\n", prog, err[0] ? err : jfs_strerror(rc));
+        if (!created)
+            fprintf(stderr, "%s: image left unchanged\n", prog);
+        return 1;
+    }
+    rc = jfs_close(fs);
+    if (rc)
+        return fail(rc, "commit");
+    ar_print_stats("imported", &st);
+    return 0;
+}
+
+static int cmd_to_archive(int argc, char **argv)
+{
+    args a;
+    const char *o, *at = NULL;
+    jfs_archive_opts ao;
+    jfs_archive_stats st;
+    jfs_fs *fs;
+    char err[1024];
+    int force = 0, rc;
+    jfs_archive_opts_init(&ao);
+    ao.warn = ar_warn;
+    args_init(&a, argc, argv);
+    while ((o = args_next(&a))) {
+        if (is(o, "-F", "--format"))
+            ao.format = args_value(&a, o);
+        else if (is(o, NULL, "--backend"))
+            ao.backend = parse_backend(args_value(&a, o));
+        else if (is(o, "-t", "--at"))
+            at = args_value(&a, o);
+        else if (is(o, NULL, "--pax"))
+            ao.pax = 1;
+        else if (is(o, NULL, "--zip64"))
+            ao.zip64 = 1;
+        else if (is(o, "-l", "--level"))
+            ao.level = atoi(args_value(&a, o));
+        else if (is(o, "-f", "--force"))
+            force = 1;
+        else
+            die("to-archive: unknown option %s", o);
+    }
+    if (a.npos < 2 || a.npos > 3)
+        die("usage: jsonfs to-archive [-F FORMAT] [--at TIME] [--pax] [--zip64] [-l LEVEL] [-f]\n"
+            "                         [--backend B] IMAGE ARCHIVE [IMAGE_DIR]");
+    if (!force && jfs_file_exists(a.pos[1]))
+        die("%s already exists (use -f to overwrite)", a.pos[1]);
+    open_ro(a.pos[0], at, &fs);
+    rc = jfs_archive_export(fs, a.npos == 3 ? a.pos[2] : "/", a.pos[1], &ao, &st, err, sizeof err);
+    jfs_close(fs);
+    if (rc) {
+        fprintf(stderr, "%s: %s\n", prog, err[0] ? err : jfs_strerror(rc));
+        return 1;
+    }
+    ar_print_stats("archived", &st);
+    return 0;
+}
+
+/* Is `path` a JSONfs image (or a URL, which can only be an image here)? */
+static int looks_like_image(const char *path)
+{
+    FILE *f;
+    char buf[1024];
+    size_t n;
+    if (jfs_is_url(path))
+        return 1;
+    f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    return strstr(buf, "\"format\"") && strstr(buf, "\"jsonfs\"") && buf[strspn(buf, " \t\r\n")] == '{';
+}
+
+static int cmd_convert(int argc, char **argv)
+{
+    int i, npos = 0;
+    const char *pos[2] = {NULL, NULL};
+    /* the first two positional arguments decide the direction */
+    for (i = 0; i < argc && npos < 2; i++) {
+        if (argv[i][0] == '-') {
+            if (!strcmp(argv[i], "-F") || !strcmp(argv[i], "--format") || !strcmp(argv[i], "--backend") ||
+                !strcmp(argv[i], "-t") || !strcmp(argv[i], "--at") || !strcmp(argv[i], "-L") ||
+                !strcmp(argv[i], "--label") || !strcmp(argv[i], "-c") || !strcmp(argv[i], "--compression") ||
+                !strcmp(argv[i], "-l") || !strcmp(argv[i], "--level") || !strcmp(argv[i], "-i") ||
+                !strcmp(argv[i], "--into"))
+                i++;
+            continue;
+        }
+        pos[npos++] = argv[i];
+    }
+    if (npos != 2)
+        die("usage: jsonfs convert [options] SOURCE DESTINATION\n"
+            "  archive -> image: jsonfs convert photos.zip photos.json\n"
+            "  image -> archive: jsonfs convert photos.json photos.tar.gz");
+    if (looks_like_image(pos[0]))
+        return cmd_to_archive(argc, argv);
+    return cmd_from_archive(argc, argv);
+}
+
+static void print_line(void *cookie, const char *line)
+{
+    (void)cookie;
+    printf("%s\n", line);
+}
+
 #ifdef _WIN32
 /* Installer helper: add/remove a directory to/from the machine PATH without
  * the 1024 character limit of NSIS strings. */
@@ -1714,6 +1941,12 @@ static void usage(FILE *f)
             "  pack [-L label] [-c algo] [-V] [-f] FOLDER IMAGE   create IMAGE from FOLDER\n"
             "  unpack [--at TIME] [-f] IMAGE FOLDER              extract IMAGE into FOLDER\n"
             "\n"
+            "Archives (zip, tar, tar.gz built in; 7z, tar.xz, tar.bz2, tar.zst, ... via libarchive):\n"
+            "  convert SOURCE DEST                     archive -> image or image -> archive\n"
+            "  from-archive [-F fmt] [mkfs opts] [--into PATH] ARCHIVE IMAGE\n"
+            "  to-archive [-F fmt] [--at TIME] [--pax] IMAGE ARCHIVE [IMAGE_DIR]\n"
+            "  archive-formats                         list supported formats\n"
+            "\n"
             "Editing without mounting:\n"
             "  add [-f] [-p] IMAGE HOST_PATH... DEST   add files/folders (like cp -r)\n"
             "  mv [-n] IMAGE SOURCE... DEST            rename / move inside the image\n"
@@ -1804,6 +2037,16 @@ int main(int argc, char **argv)
         return cmd_ls(argc, argv);
     if (!strcmp(cmd, "cat"))
         return cmd_cat(argc, argv);
+    if (!strcmp(cmd, "from-archive") || !strcmp(cmd, "import-archive"))
+        return cmd_from_archive(argc, argv);
+    if (!strcmp(cmd, "to-archive") || !strcmp(cmd, "export-archive"))
+        return cmd_to_archive(argc, argv);
+    if (!strcmp(cmd, "convert"))
+        return cmd_convert(argc, argv);
+    if (!strcmp(cmd, "archive-formats")) {
+        jfs_archive_list_formats(print_line, NULL);
+        return 0;
+    }
     if (!strcmp(cmd, "pack") || !strcmp(cmd, "create") || !strcmp(cmd, "from-dir"))
         return cmd_pack(argc, argv);
     if (!strcmp(cmd, "unpack") || !strcmp(cmd, "to-dir"))

@@ -482,7 +482,6 @@ static int lz4_decompress(const uint8_t *in, size_t n, uint8_t *out, size_t expe
 /* ======================================================================== */
 /* Registry                                                                   */
 /* ======================================================================== */
-int jfs_deflate_compress(const uint8_t *in, size_t n, int level, uint8_t **out, size_t *outlen);
 int jfs_deflate_decompress(const uint8_t *in, size_t n, uint8_t *out, size_t expected);
 
 static const jfs_compressor compressors[] = {
@@ -590,5 +589,114 @@ int jfs_decode_blob(const char *algo, const char *b64, size_t b64len, uint64_t e
         }
     }
     *out = buf;
+    return 0;
+}
+
+/* ======================================================================== */
+/* CRC-32 and gzip                                                            */
+/* ======================================================================== */
+uint32_t jfs_crc32(uint32_t crc, const void *data, size_t n)
+{
+    static uint32_t table[256];
+    static int init;
+    const uint8_t *p = data;
+    size_t i;
+    if (!init) {
+        uint32_t k, c;
+        int b;
+        for (k = 0; k < 256; k++) {
+            c = k;
+            for (b = 0; b < 8; b++)
+                c = (c & 1) ? 0xEDB88320U ^ (c >> 1) : c >> 1;
+            table[k] = c;
+        }
+        init = 1;
+    }
+    crc = ~crc;
+    for (i = 0; i < n; i++)
+        crc = table[(crc ^ p[i]) & 0xff] ^ (crc >> 8);
+    return ~crc;
+}
+
+static uint32_t rd32le(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+int jfs_gzip_decode(const uint8_t *in, size_t n, uint8_t **out, size_t *outlen)
+{
+    jfs_buf all;
+    size_t pos = 0;
+    jfs_buf_init(&all);
+    while (pos + 18 <= n && in[pos] == 0x1f && in[pos + 1] == 0x8b) {
+        size_t p = pos + 10, used = 0, dlen = 0;
+        uint8_t flg = in[pos + 3], *data = NULL;
+        int rc;
+        if (in[pos + 2] != 8)
+            goto bad; /* only DEFLATE is defined */
+        if (flg & 4) { /* FEXTRA */
+            if (p + 2 > n)
+                goto bad;
+            p += 2 + ((size_t)in[p] | ((size_t)in[p + 1] << 8));
+        }
+        if (flg & 8) /* FNAME */
+            while (p < n && in[p++]) {
+            }
+        if (flg & 16) /* FCOMMENT */
+            while (p < n && in[p++]) {
+            }
+        if (flg & 2) /* FHCRC */
+            p += 2;
+        if (p >= n)
+            goto bad;
+        rc = jfs_inflate_alloc(in + p, n - p, &data, &dlen, &used);
+        if (rc)
+            goto bad;
+        p += used;
+        if (p + 8 > n || rd32le(in + p) != jfs_crc32(0, data, dlen) || rd32le(in + p + 4) != (uint32_t)dlen) {
+            free(data);
+            goto bad;
+        }
+        jfs_buf_append(&all, data, dlen);
+        free(data);
+        pos = p + 8;
+        while (pos < n && in[pos] == 0) /* padding some tools append */
+            pos++;
+    }
+    if (pos == 0)
+        goto bad;
+    *outlen = all.len;
+    *out = (uint8_t *)jfs_buf_steal(&all, NULL);
+    return 0;
+bad:
+    jfs_buf_free(&all);
+    return -JFS_ECORRUPT;
+}
+
+int jfs_gzip_encode(const uint8_t *in, size_t n, int level, uint8_t **out, size_t *outlen)
+{
+    static const uint8_t hdr[10] = {0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3 /* Unix */};
+    uint8_t *c, tr[8];
+    size_t cl;
+    uint32_t crc = jfs_crc32(0, in, n);
+    jfs_buf b;
+    int rc = jfs_deflate_compress(in, n, level, &c, &cl);
+    if (rc)
+        return rc;
+    jfs_buf_init(&b);
+    jfs_buf_append(&b, hdr, 10);
+    jfs_buf_append(&b, c, cl);
+    free(c);
+    tr[0] = (uint8_t)crc;
+    tr[1] = (uint8_t)(crc >> 8);
+    tr[2] = (uint8_t)(crc >> 16);
+    tr[3] = (uint8_t)(crc >> 24);
+    tr[4] = (uint8_t)n;
+    tr[5] = (uint8_t)(n >> 8);
+    tr[6] = (uint8_t)(n >> 16);
+    tr[7] = (uint8_t)(n >> 24);
+    jfs_buf_append(&b, tr, 8);
+    *outlen = b.len;
+    *out = (uint8_t *)jfs_buf_steal(&b, NULL);
     return 0;
 }

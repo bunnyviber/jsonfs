@@ -50,6 +50,9 @@ jsonfs ls -l notes.json                   # or read it without mounting
   mounted when the server fails; optional on-disk cache for offline mounts.
 * **File system events** (inotify, kqueue/FSEvents, ReadDirectoryChangesW)
   for local changes *and* for remote updates of web mounts.
+* **Archive conversion**: `jsonfs convert photos.zip photos.json` and back;
+  zip, tar and tar.gz built in, 7z / tar.xz / tar.bz2 / tar.zst / cpio / iso
+  / rar (read) … through libarchive when installed.
 * **Folder ↔ image tools**: `jsonfs pack` / `unpack`, plus `add`, `mv`, `get`,
   `rm`, `mkdir` to edit images without mounting.
 * **Crash safety** – commits are atomic (write temp file, fsync, rename).

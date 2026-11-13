@@ -171,6 +171,48 @@ NFSv4, SMB). Multi-attach requires schema 2 (`jsonfs upgrade`).
 | `jsonfs prune --before TIME IMAGE` | drop old history |
 | `jsonfs ls/cat/import/export` | access content without mounting |
 
+## Archives (zip, tar, 7z, ...)
+
+```sh
+jsonfs convert photos.zip photos.json        # archive -> new image (format from the contents)
+jsonfs convert photos.json photos.tar.gz     # image -> archive (format from the extension)
+jsonfs from-archive -c lz4 -V src.tar.xz src.json     # with mkfs options
+jsonfs from-archive --into /vendor lib.zip project.json   # into a folder of an existing image
+jsonfs to-archive --at -2d project.json yesterday.7z     # a past state of a versioned image
+jsonfs to-archive project.json docs.zip /docs            # only a sub-folder
+jsonfs archive-formats                       # what is available here
+```
+
+| format | extensions | how |
+|---|---|---|
+| tar (ustar, pax, GNU, v7) | `.tar` | built in, read + write |
+| gzip compressed tar | `.tar.gz` `.tgz` | built in, read + write |
+| zip (stored / DEFLATE, zip64) | `.zip` `.jar` | built in, read + write |
+| 7z, tar.xz, tar.bz2, tar.zst, tar.lz4, tar.lzma, tar.lz, cpio, iso, xar, ar, shar, warc | | libarchive, read + write |
+| rar, rar5, cab, lha and anything else libarchive reads | | libarchive, read only |
+
+The built-in formats need nothing and work on every platform including
+Windows XP. Everything else uses libarchive, loaded at runtime when it is
+installed (part of macOS and FreeBSD, `libarchive13` on Linux, `archive.dll`
+next to `jsonfs.exe` on Windows); zip archives with bzip2/LZMA/zstd members
+automatically fall back to it.
+
+What is converted:
+
+* regular files, directories, symlinks, hard links (tar, cpio; zip and 7z
+  store the content twice), FIFOs and device nodes (tar, cpio), permissions,
+  modification and access times, extended attributes (pax `SCHILY.xattr`)
+* owners: kept when importing as root (like `tar`), otherwise the files
+  belong to you; `--same-owner` / `--no-same-owner` override
+* names: UTF-8 everywhere (zip: the UTF-8 flag and Info-ZIP's Unicode path
+  field are honoured, legacy names are decoded as code page 437); long names
+  use ustar prefixes, pax or GNU long-name records as needed
+* tar writes plain ustar where possible and pax headers only when needed;
+  `--pax` always adds them (nanosecond and access times)
+* safety: entries with `..` components are skipped, absolute paths are kept
+  inside the image, checksums (zip CRC-32, gzip CRC) are verified and a
+  failed import leaves no half-filled image behind
+
 ## Folders and files without mounting
 
 ```sh
