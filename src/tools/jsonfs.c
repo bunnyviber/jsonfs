@@ -18,6 +18,7 @@
 
 #include "../lib/jfs_codec.h"
 #include "../lib/jfs_fs.h"
+#include "../lib/jfs_http.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -154,6 +155,8 @@ static int cmd_mkfs(int argc, char **argv)
     }
     if (a.npos != 1)
         die("usage: jsonfs mkfs [-L label] [-c compression] [-V] [--schema N] [-U uuid] [-f] IMAGE");
+    if (jfs_is_url(a.pos[0]))
+        die("cannot create an image at a URL; create it locally and upload it");
 #ifndef _WIN32
     if (!mo.root_uid && !mo.root_gid && getuid() != 0) {
         mo.root_uid = (uint32_t)getuid();
@@ -1206,6 +1209,10 @@ static void usage(FILE *f)
             "  compressors                      list compression algorithms\n"
             "  version                          print the version\n"
             "\n"
+            "Read-only commands (info, fsck, ls, cat, export, log, snapshot source)\n"
+            "also accept http:// and https:// URLs.  https certificates are verified;\n"
+            "-k/--insecure skips verification, --cacert FILE adds trusted CAs.\n"
+            "\n"
             "TIME accepts RFC 3339 (2026-11-11T10:00:00Z, offsets allowed), dates\n"
             "(2026-11-11), Unix epochs (@1762855200) and relative times (-2h, -3d).\n"
             "Mount images with jsonfs-mount (see 'jsonfs-mount --help').\n",
@@ -1235,6 +1242,24 @@ int main(int argc, char **argv)
     cmd = argv[1];
     argc -= 2;
     argv += 2;
+    {
+        /* global options for http(s) images, accepted anywhere after the command */
+        int i, j = 0, insecure = 0;
+        const char *cafile = NULL;
+        for (i = 0; i < argc; i++) {
+            if (!strcmp(argv[i], "-k") || !strcmp(argv[i], "--insecure"))
+                insecure = 1;
+            else if (!strcmp(argv[i], "--cacert") && i + 1 < argc)
+                cafile = argv[++i];
+            else if (!strncmp(argv[i], "--cacert=", 9))
+                cafile = argv[i] + 9;
+            else
+                argv[j++] = argv[i];
+        }
+        argc = j;
+        argv[argc] = NULL;
+        jfs_http_configure(insecure, cafile);
+    }
     if (!strcmp(cmd, "mkfs"))
         return cmd_mkfs(argc, argv);
     if (!strcmp(cmd, "info"))

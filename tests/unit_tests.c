@@ -7,6 +7,7 @@
  */
 #include "jfs_codec.h"
 #include "jfs_fs.h"
+#include "jfs_http.h"
 #include "jfs_json.h"
 
 #include <stdio.h>
@@ -163,6 +164,34 @@ static void test_json(void)
     CHECK(jv_parse("[1 2]", 5, err, sizeof err) == NULL);
     CHECK(jv_parse("\"\\x\"", 4, err, sizeof err) == NULL);
     CHECK(jv_parse("{} x", 4, err, sizeof err) == NULL);
+}
+
+static void test_urls(void)
+{
+    char out[256];
+    const char *img = tmp_path("url-ro.json");
+    jfs_open_opts o;
+    jfs_fs *fs;
+    char err[200];
+    jfs_mkfs_opts mo;
+    CHECK(jfs_is_url("https://pupu.me/fs/pupu-fs.json"));
+    CHECK(jfs_is_url("HTTP://example.com/x.json"));
+    CHECK(!jfs_is_url("/srv/https://x"));
+    CHECK(!jfs_is_url("ftp://example.com/x.json"));
+    CHECK(!jfs_is_url("C:\\data\\x.json"));
+    jfs_url_redact("https://user:secret@host.example/a@b.json", out, sizeof out);
+    CHECK(!strcmp(out, "https://***@host.example/a@b.json"));
+    jfs_url_redact("https://host.example/a@b.json", out, sizeof out);
+    CHECK(!strcmp(out, "https://host.example/a@b.json"));
+    /* URLs are never opened writable and never created */
+    jfs_open_opts_init(&o);
+    CHECK_RC(jfs_open("http://127.0.0.1:1/x.json", &o, &fs, err, sizeof err), -JFS_EROFS);
+    o.readonly = 1;
+    o.lockmode = JFS_LOCKMODE_SHARED;
+    CHECK_RC(jfs_open("http://127.0.0.1:1/x.json", &o, &fs, err, sizeof err), -JFS_EINVAL);
+    memset(&mo, 0, sizeof mo);
+    CHECK_RC(jfs_mkfs("https://127.0.0.1:1/x.json", &mo, 1), -JFS_EROFS);
+    CHECK_RC(jfs_snapshot(img, jfs_now(), "https://127.0.0.1:1/out.json", 0, NULL, 1), -JFS_EROFS);
 }
 
 static void test_time(void)
@@ -736,6 +765,7 @@ int main(int argc, char **argv)
     test_compressors();
     test_json();
     test_time();
+    test_urls();
     test_posix();
     test_versioning();
     test_upgrade();

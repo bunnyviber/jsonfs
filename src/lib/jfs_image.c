@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "jfs_internal.h"
+#include "jfs_http.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -850,6 +851,8 @@ int jfs_mkfs(const char *image, const jfs_mkfs_opts *o, int overwrite)
         memset(&dflt, 0, sizeof dflt);
         o = &dflt;
     }
+    if (jfs_is_url(image))
+        return -JFS_EROFS;
     if (o->compression && jfs_compression_parse(o->compression, NULL, NULL))
         return -JFS_EINVAL;
     if (o->schema && (o->schema < JFS_SCHEMA_MIN || o->schema > JFS_SCHEMA_LATEST))
@@ -922,15 +925,15 @@ static int read_and_parse(const char *path, jv **root, char *err, size_t errlen)
     char *text;
     size_t len;
     char perr[200];
-    int rc = jfs_read_file(path, &text, &len);
-    if (rc) {
-        snprintf(err, errlen, "cannot read %s: %s", path, jfs_strerror(rc));
+    char shown[1024];
+    int rc = jfs_load_bytes(path, &text, &len, err, errlen);
+    if (rc)
         return rc;
-    }
     *root = jv_parse(text, len, perr, sizeof perr);
     free(text);
     if (!*root) {
-        snprintf(err, errlen, "%s: invalid JSON: %s", path, perr);
+        jfs_url_redact(path, shown, sizeof shown);
+        snprintf(err, errlen, "%s: invalid JSON: %s", shown, perr);
         return -JFS_ECORRUPT;
     }
     return 0;
@@ -952,9 +955,20 @@ int jfs_open(const char *image, const jfs_open_opts *o, jfs_fs **out, char *err,
         jfs_open_opts_init(&dflt);
         o = &dflt;
     }
+    if (jfs_is_url(image)) {
+        /* remote images are fetched once and are strictly read-only */
+        if (!o->readonly && !o->has_at) {
+            snprintf(err, errlen, "remote (http/https) images can only be opened read-only");
+            return -JFS_EROFS;
+        }
+        if (o->lockmode == JFS_LOCKMODE_SHARED) {
+            snprintf(err, errlen, "multi-attach (shared) is not available for remote images");
+            return -JFS_EINVAL;
+        }
+    }
     jfs_fs_create_empty(&fs);
     fs->image_path = jfs_strdup(image);
-    fs->lockmode = o->has_at ? JFS_LOCKMODE_NONE : o->lockmode;
+    fs->lockmode = (o->has_at || jfs_is_url(image)) ? JFS_LOCKMODE_NONE : o->lockmode;
     fs->readonly = o->readonly || o->has_at;
     fs->shared = fs->lockmode == JFS_LOCKMODE_SHARED;
     fs->repair = o->repair;
@@ -992,7 +1006,7 @@ int jfs_open(const char *image, const jfs_open_opts *o, jfs_fs **out, char *err,
     if (fs->shared && fs->lock)
         jfs_lockfile_lock(fs->lock, JFS_LOCK_TXN, 0, 1);
     rc = read_and_parse(image, &root, err, errlen);
-    if (!rc)
+    if (!rc && !jfs_is_url(image))
         jfs_file_signature(image, &fs->sig);
     if (fs->shared && fs->lock)
         jfs_lockfile_unlock(fs->lock, JFS_LOCK_TXN);

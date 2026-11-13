@@ -78,6 +78,7 @@ const char *jfs_strerror(int err)
     case JFS_EVERSION: return "unsupported JSONfs schema version";
     case JFS_ELOCKED: return "image is in use (mounted or locked by another process)";
     case JFS_ECHECKSUM: return "checksum mismatch";
+    case JFS_EREMOTE: return "cannot fetch the remote image";
     default: return "unknown error";
     }
 }

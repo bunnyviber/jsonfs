@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "jfs_internal.h"
+#include "jfs_http.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -115,17 +116,22 @@ int jfs_fsck(const char *image, int repair, int verbose, jfs_report_fn report, v
     c.verbose = verbose;
     c.res = res;
 
-    if (jfs_lockfile_open(image, &lf) == 0 && jfs_lockfile_lock_timeout(lf, JFS_LOCK_ATTACH, repair, jfs_lock_timeout_ms()) != 0) {
+    if (jfs_is_url(image) && repair)
+        return -JFS_EROFS;
+    if (!jfs_is_url(image) && jfs_lockfile_open(image, &lf) == 0 && jfs_lockfile_lock_timeout(lf, JFS_LOCK_ATTACH, repair, jfs_lock_timeout_ms()) != 0) {
         jfs_lockfile_close(lf, 0);
         if (repair)
             return -JFS_ELOCKED;
         rep(&c, 1, "image is currently mounted; results reflect the last committed state");
         lf = NULL;
     }
-    rc = jfs_read_file(image, &text, &len);
-    if (rc) {
-        rep(&c, 2, "cannot read %s: %s", image, jfs_strerror(rc));
-        goto out_lock;
+    {
+        char lerr[1200];
+        rc = jfs_load_bytes(image, &text, &len, lerr, sizeof lerr);
+        if (rc) {
+            rep(&c, 2, "%s", lerr);
+            goto out_lock;
+        }
     }
     root = jv_parse(text, len, perr, sizeof perr);
     free(text);
@@ -449,6 +455,8 @@ int jfs_snapshot(const char *image, jfs_time at, const char *out_image, int keep
     jfs_buf out;
     size_t i;
     int rc;
+    if (jfs_is_url(out_image))
+        return -JFS_EROFS;
     if (!overwrite && jfs_file_exists(out_image))
         return -JFS_EEXIST;
     jfs_open_opts_init(&o);
@@ -787,9 +795,11 @@ int jfs_list_versions(const char *image, const char *path, const jfs_time *at, j
     jfs_fs_free(fs);
     if (rc)
         return rc;
-    rc = jfs_read_file(image, &text, &len);
-    if (rc)
+    rc = jfs_load_bytes(image, &text, &len, err, sizeof err);
+    if (rc) {
+        jfs_log("%s", err);
         return rc;
+    }
     root = jv_parse(text, len, NULL, 0);
     free(text);
     if (!root)
