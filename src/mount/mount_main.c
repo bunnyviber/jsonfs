@@ -21,6 +21,7 @@
 #endif
 
 #include "mount_common.h"
+#include "../lib/jfs_http.h"
 #include "../lib/jfs_codec.h"
 
 #include <errno.h>
@@ -44,6 +45,9 @@ jfs_fs *jfs_mount_fs;
 jfs_mount_opts jfs_mount_cfg;
 static const char *prog = "jsonfs-mount";
 
+static int rw_explicit, insecure;
+static char *cafile;
+
 static void usage(FILE *f)
 {
     fprintf(f,
@@ -51,6 +55,8 @@ static void usage(FILE *f)
             "\n"
             "Mounts the JSONfs image IMAGE on MOUNTPOINT (a directory; on Windows a\n"
             "drive letter such as X: or an empty NTFS directory).\n"
+            "IMAGE may be a local file or an http:// or https:// URL; web images are\n"
+            "downloaded once and mounted read-only.\n"
             "\n"
             "options:\n"
             "  -o OPT[,OPT...]      mount options (see below)\n"
@@ -59,6 +65,8 @@ static void usage(FILE *f)
             "  -s                   single threaded\n"
             "  -h, --help           this help\n"
             "  -V, --version        print the version\n"
+            "  -k, --insecure       https: do not verify the server certificate\n"
+            "  --cacert FILE        https: also trust the CA certificates in FILE (PEM)\n"
             "\n"
             "JSONfs mount options:\n"
             "  ro / rw              read-only / read-write (default rw)\n"
@@ -70,6 +78,7 @@ static void usage(FILE *f)
             "                       through a network share) may use the image concurrently\n"
             "  commit=SECONDS       commit interval for single-attach mounts (default 5,\n"
             "                       0 = commit after every change)\n"
+            "  insecure, cafile=F   same as --insecure / --cacert F\n"
             "  backend=winfsp|dokan Windows only: force a kernel interface\n"
             "  volname=NAME         Windows only: volume label shown in Explorer\n"
             "\n"
@@ -103,8 +112,15 @@ static void parse_o(const char *list)
             continue;
         if (!strcmp(tok, "ro"))
             jfs_mount_cfg.readonly = 1;
-        else if (!strcmp(tok, "rw"))
+        else if (!strcmp(tok, "rw")) {
             jfs_mount_cfg.readonly = 0;
+            rw_explicit = 1;
+        } else if (!strcmp(tok, "insecure"))
+            insecure = 1;
+        else if (!strncmp(tok, "cafile=", 7) || !strncmp(tok, "cacert=", 7)) {
+            free(cafile);
+            cafile = jfs_strdup(tok + 7);
+        }
         else if (!strcmp(tok, "shared") || !strcmp(tok, "multiattach") || !strcmp(tok, "multi-attach"))
             jfs_mount_cfg.shared = 1;
         else if (!strcmp(tok, "exclusive"))
@@ -263,6 +279,16 @@ int main(int argc, char **argv)
             jfs_mount_cfg.debug = 1;
             jfs_mount_cfg.foreground = 1;
             jfs_debug = 1;
+        } else if (!strcmp(a, "-k") || !strcmp(a, "--insecure")) {
+            insecure = 1;
+        } else if (!strcmp(a, "--cacert") || !strncmp(a, "--cacert=", 9)) {
+            const char *v = a[8] == '=' ? a + 9 : (i + 1 < argc ? argv[++i] : NULL);
+            if (!v) {
+                usage(stderr);
+                return 2;
+            }
+            free(cafile);
+            cafile = jfs_strdup(v);
         } else if (!strcmp(a, "-s")) {
             jfs_mount_cfg.single_thread = 1;
         } else if (!strcmp(a, "-n") || !strcmp(a, "-v")) {
@@ -284,8 +310,21 @@ int main(int argc, char **argv)
         usage(stderr);
         return 2;
     }
-    jfs_mount_cfg.image = absolute_path(pos[0]);
-    if (!jfs_file_exists(jfs_mount_cfg.image)) {
+    jfs_http_configure(insecure, cafile);
+    if (jfs_is_url(pos[0])) {
+        if (rw_explicit) {
+            fprintf(stderr, "%s: images mounted over http/https are read-only; drop the rw option\n", prog);
+            return 2;
+        }
+        if (jfs_mount_cfg.shared) {
+            fprintf(stderr, "%s: multi-attach (shared) is not available for http/https images\n", prog);
+            return 2;
+        }
+        jfs_mount_cfg.readonly = 1;
+        jfs_mount_cfg.image = jfs_strdup(pos[0]);
+        if (insecure && !strncmp(pos[0], "https", 5))
+            fprintf(stderr, "%s: warning: TLS certificate verification is disabled (--insecure)\n", prog);
+    } else if (jfs_mount_cfg.image = absolute_path(pos[0]), !jfs_file_exists(jfs_mount_cfg.image)) {
         fprintf(stderr, "%s: %s: no such image (create one with 'jsonfs mkfs')\n", prog, pos[0]);
         return 1;
     }

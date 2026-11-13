@@ -39,6 +39,10 @@ jsonfs ls -l notes.json                   # or read it without mounting
   coordinated by byte-range locks in a lock file (works with `fcntl` on POSIX
   and `LockFileEx` on Windows, also across NFS/SMB), with close-to-open
   consistency.
+* **Mount over the web**: `jsonfs-mount https://pupu.me/fs/pupu-fs.json folder`
+  mounts a published image read-only. Certificates are verified by default
+  (`--insecure` to skip, `--cacert` for private CAs); plain `http://` works
+  too and never follows redirects.
 * **Crash safety** – commits are atomic (write temp file, fsync, rename).
 * **Offline maintenance toolkit** (`jsonfs`): `fsck` (verifies every
   checksum, including history; repairs structure), `snapshot` (extract the

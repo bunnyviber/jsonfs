@@ -32,13 +32,13 @@ MOUNT_LIBS :=
 WINFSP_INC ?= third_party/winfsp/inc
 WIN_COMMON_CFLAGS = -D_WIN32_WINNT=0x0501 -DWINVER=0x0501 -D__USE_MINGW_ANSI_STDIO=0 \
                     $(if $(wildcard $(WINFSP_INC)/fuse/fuse.h),-I$(WINFSP_INC) -DJFS_HAVE_WINFSP=1,)
-WIN_COMMON_LIBS   = -static -static-libgcc -luser32 -ladvapi32 -lkernel32
+WIN_COMMON_LIBS   = -static -static-libgcc -lwinhttp -luser32 -ladvapi32 -lkernel32
 
 ifeq ($(TARGET),native)
   CC ?= cc
   UNAME_S := $(shell uname -s 2>/dev/null || echo Windows)
   ifeq ($(UNAME_S),Linux)
-    TOOL_LIBS  := -lpthread
+    TOOL_LIBS  := -lpthread -ldl
     MOUNT_LIBS := -lpthread -ldl
   else ifeq ($(UNAME_S),Darwin)
     TOOL_LIBS  :=
@@ -56,22 +56,22 @@ ifeq ($(TARGET),native)
 else ifeq ($(TARGET),linux-x86_64)
   CC := $(ZIG) cc -target x86_64-linux-gnu.2.17
   AR := $(ZIG) ar
-  TOOL_LIBS := -lpthread
+  TOOL_LIBS := -lpthread -ldl
   MOUNT_LIBS := -lpthread -ldl
 else ifeq ($(TARGET),linux-i686)
   CC := $(ZIG) cc -target x86-linux-gnu.2.17
   AR := $(ZIG) ar
-  TOOL_LIBS := -lpthread
+  TOOL_LIBS := -lpthread -ldl
   MOUNT_LIBS := -lpthread -ldl
 else ifeq ($(TARGET),linux-aarch64)
   CC := $(ZIG) cc -target aarch64-linux-gnu.2.17
   AR := $(ZIG) ar
-  TOOL_LIBS := -lpthread
+  TOOL_LIBS := -lpthread -ldl
   MOUNT_LIBS := -lpthread -ldl
 else ifeq ($(TARGET),linux-armv7)
   CC := $(ZIG) cc -target arm-linux-gnueabihf.2.17
   AR := $(ZIG) ar
-  TOOL_LIBS := -lpthread
+  TOOL_LIBS := -lpthread -ldl
   MOUNT_LIBS := -lpthread -ldl
 else ifeq ($(TARGET),macos-x86_64)
   CC := $(ZIG) cc -target x86_64-macos.10.13
@@ -112,8 +112,8 @@ else ifeq ($(TARGET),windows-arm64)
   AR := $(ZIG) ar
   EXE := .exe
   TARGET_CFLAGS += $(if $(wildcard $(WINFSP_INC)/fuse/fuse.h),-I$(WINFSP_INC) -DJFS_HAVE_WINFSP=1,)
-  TOOL_LIBS := -luser32 -ladvapi32
-  MOUNT_LIBS := -luser32 -ladvapi32
+  TOOL_LIBS := -lwinhttp -luser32 -ladvapi32
+  MOUNT_LIBS := -lwinhttp -luser32 -ladvapi32
 else
   $(error unknown TARGET '$(TARGET)'; see scripts/targets.mk)
 endif

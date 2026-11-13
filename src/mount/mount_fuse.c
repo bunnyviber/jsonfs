@@ -33,6 +33,7 @@
 #endif
 
 #include "mount_common.h"
+#include "../lib/jfs_http.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -920,7 +921,9 @@ int jfs_fuse_run(void)
 #else
     {
         /* fsname must not contain commas */
-        char *fsn = jfs_asprintf("jsonfs:%s", jfs_mount_cfg.image), *q;
+        char shown[1024], *fsn, *q;
+        jfs_url_redact(jfs_mount_cfg.image, shown, sizeof shown); /* no passwords in the mount table */
+        fsn = jfs_asprintf("jsonfs:%s", shown);
         for (q = fsn; *q; q++)
             if (*q == ',')
                 *q = '_';

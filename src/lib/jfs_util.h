@@ -20,7 +20,10 @@
 #define JFS_WINDOWS 1
 #endif
 
-#define JFS_VERSION_STRING "1.0.0"
+#define JFS_VERSION_STRING "1.1.0"
+#define JFS_WIDEN2_(x) L##x
+#define JFS_WIDEN_(x) JFS_WIDEN2_(x)
+#define JFS_VERSION_WIDE JFS_WIDEN_(JFS_VERSION_STRING)
 
 /* ------------------------------------------------------------------------ */
 /* Error codes.                                                               */
@@ -60,7 +63,8 @@ enum {
     JFS_ECORRUPT = 1000, /* image is malformed */
     JFS_EVERSION = 1001, /* unsupported schema version */
     JFS_ELOCKED = 1002,  /* image is in use by somebody else */
-    JFS_ECHECKSUM = 1003 /* checksum mismatch */
+    JFS_ECHECKSUM = 1003, /* checksum mismatch */
+    JFS_EREMOTE = 1004    /* fetching a remote image failed */
 };
 
 const char *jfs_strerror(int err); /* accepts positive or negative codes */

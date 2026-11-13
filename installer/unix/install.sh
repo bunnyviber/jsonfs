@@ -93,6 +93,8 @@ check_fuse() {
             say "        apt install fuse3   |   dnf install fuse3   |   pacman -S fuse3   |   zypper in fuse3"
         fi
         [ -e /dev/fuse ] || say "note: /dev/fuse is missing (modprobe fuse)"
+        ldconfig -p 2>/dev/null | grep -q 'libcurl' ||
+            say "note: install libcurl (libcurl4 / libcurl) to mount http:// and https:// images"
         ;;
     Darwin)
         if [ ! -e /usr/local/lib/libfuse-t.dylib ] && [ ! -e /usr/local/lib/libfuse.2.dylib ] &&
@@ -108,6 +110,7 @@ check_fuse() {
             say "note: install the FUSE library: pkg install fusefs-libs3"
         fi
         say "note: to mount as a regular user: sysctl vfs.usermount=1"
+        [ -e /usr/local/lib/libcurl.so.4 ] || say "note: pkg install curl  (needed for http:// and https:// images)"
         ;;
     esac
 }

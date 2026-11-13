@@ -9,7 +9,7 @@
 # loaded at runtime (dlopen) on Linux, macOS and FreeBSD; WinFsp / Dokan are
 # loaded at runtime on Windows, so no driver SDK is needed to link.
 
-VERSION     := 1.0.0
+VERSION     := 1.1.0
 TARGET      ?= native
 BUILD       ?= build/$(TARGET)
 
@@ -22,7 +22,7 @@ CFLAGS      += $(CSTD) $(OPT) $(WARN) -DJFS_BUILD_VERSION=\"$(VERSION)\" $(TARGE
 LDFLAGS     += $(TARGET_LDFLAGS)
 
 LIB_SRCS    := src/lib/jfs_util.c src/lib/jfs_json.c src/lib/jfs_codec.c src/lib/jfs_deflate.c \
-               src/lib/jfs_image.c src/lib/jfs_vfs.c src/lib/jfs_maint.c
+               src/lib/jfs_image.c src/lib/jfs_vfs.c src/lib/jfs_maint.c src/lib/jfs_http.c
 TOOL_SRCS   := src/tools/jsonfs.c
 MOUNT_SRCS  := src/mount/mount_main.c src/mount/mount_fuse.c src/mount/mount_dokan.c
 
@@ -71,6 +71,7 @@ test: all $(UNIT_BIN)
 	$(UNIT_BIN)
 	sh tests/toolkit_test.sh $(abspath $(TOOL_BIN))
 	sh tests/mount_test.sh $(abspath $(TOOL_BIN)) $(abspath $(MOUNT_BIN))
+	sh tests/http_test.sh $(abspath $(TOOL_BIN)) $(abspath $(MOUNT_BIN))
 
 # -------------------------------------------------------------- install ----
 PREFIX ?= /usr/local

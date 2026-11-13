@@ -7,7 +7,8 @@ runtime, so **no driver SDK is needed to link** and every target can be
 cross-compiled from one Linux machine.
 
 ```
-src/lib/      core library: image format, POSIX semantics, versioning, maintenance
+src/lib/      core library: image format, POSIX semantics, versioning, maintenance,
+              http(s) fetching (libcurl via dlopen / WinHTTP)
 src/tools/    jsonfs  (toolkit; also mkfs.jsonfs / fsck.jsonfs)
 src/mount/    jsonfs-mount (FUSE 2/3, macFUSE, FUSE-T, WinFsp, Dokan 0.6 backends)
 tests/        unit tests, toolkit tests, FUSE mount tests
@@ -81,6 +82,9 @@ Linux and macOS and builds all release artifacts.
 
 * `JSONFS_DEBUG=1 jsonfs ...` / `jsonfs-mount -d ...` print commits, reloads and FUSE traffic.
 * `JSONFS_FUSE_LIBRARY=/path/libfuse.so.2 jsonfs-mount ...` forces a FUSE library.
+* `JSONFS_CURL_LIBRARY=/path/libcurl.so.4` forces the libcurl used for http(s) images.
+* `tests/http_test.sh` (part of `make test`) starts local HTTP/HTTPS servers
+  (python3 + openssl) to test web mounts, certificate checks and redirects.
 * `make BUILD=build/asan OPT="-O1 -g -fsanitize=address,undefined" LDFLAGS=-fsanitize=address,undefined test`
   runs everything under ASan/UBSan.
 * For extra POSIX conformance testing, run
