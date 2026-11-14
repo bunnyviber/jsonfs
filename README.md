@@ -66,7 +66,8 @@ jsonfs ls -l notes.json                   # or read it without mounting
   are loaded at runtime, so one binary per platform works with whichever is
   installed.
 * **Installers with uninstallers**: self-extracting `.run` for
-  Linux/macOS/FreeBSD, NSIS `setup.exe` for Windows.
+  Linux/macOS/FreeBSD, NSIS `setup.exe` for Windows (with or without the
+  WinFsp / Dokan drivers bundled).
 * No dependencies: plain C99, cross-compiled for 13 targets from Linux.
 
 ## Documentation
@@ -74,6 +75,8 @@ jsonfs ls -l notes.json                   # or read it without mounting
 * [docs/USAGE.md](docs/USAGE.md) – mounting, options, versioning, multi-attach, maintenance, installers
 * [docs/FORMAT.md](docs/FORMAT.md) – the JSON image format
 * [docs/BUILDING.md](docs/BUILDING.md) – native and cross builds, release pipeline
+* [docs/PACKAGES.md](docs/PACKAGES.md) – what each release file is and which one to download
+* macOS "Operation not permitted" in your home folder → [code signing](docs/USAGE.md#macos-code-signing)
 
 ## Quick build
 
@@ -87,3 +90,5 @@ scripts/fetch-deps.sh all && scripts/build-release.sh all   # every platform + i
 MIT (see [LICENSE](LICENSE)). The Windows driver uses, when installed,
 WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
 (https://github.com/winfsp/winfsp), or Dokan (https://github.com/dokan-dev/dokany).
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the drivers bundled in
+the `-setup-with-drivers.exe` installers.

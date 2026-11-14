@@ -9,7 +9,7 @@
 # loaded at runtime (dlopen) on Linux, macOS and FreeBSD; WinFsp / Dokan are
 # loaded at runtime on Windows, so no driver SDK is needed to link.
 
-VERSION     := 1.3.0
+VERSION     := 1.3.1
 TARGET      ?= native
 BUILD       ?= build/$(TARGET)
 

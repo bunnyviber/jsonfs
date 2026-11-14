@@ -55,7 +55,7 @@ jobs:
           sh tests/archive_test.sh "$PWD/build/native/bin/jsonfs"
 
       - name: Build all targets and installers
-        run: scripts/build-release.sh all
+        run: scripts/build-release.sh --bundle-drivers all
 
       - name: Release notes
         run: |
@@ -70,13 +70,15 @@ jobs:
             echo
             echo "| platform | files |"
             echo "|---|---|"
-            echo "| Windows XP - 11 (32/64 bit), Windows on ARM | \`*-windows-*-setup.exe\` (installer + uninstaller), \`*-windows-*.zip\` (portable) |"
+            echo "| Windows XP - 11 (32/64 bit), Windows on ARM | \`*-windows-*-setup-with-drivers.exe\` (installs WinFsp / Dokan if missing), \`*-windows-*-setup.exe\` (no drivers), \`*-windows-*.zip\` (portable) |"
             echo "| Linux x86_64 / i686 / aarch64 / armv7 | \`*-linux-*.run\` (\`sudo sh FILE\` installs, \`... uninstall\` removes), \`*.tar.gz\` |"
             echo "| macOS x86_64 / Apple Silicon | \`*-macos-*.run\`, \`*.tar.gz\` |"
             echo "| FreeBSD x86_64 / aarch64 | \`*-freebsd-*.run\`, \`*.tar.gz\` |"
             echo
             echo "Mounting needs the platform's FUSE (libfuse 2/3, macFUSE or FUSE-T, fusefs) - or WinFsp"
-            echo "(Windows 7+) / Dokan 0.6 (XP, Vista). Checksums: \`SHA256SUMS\`."
+            echo "(Windows 7+) / Dokan 0.6 (XP, Vista). macOS: see \"macOS: code signing\" in docs/USAGE.md if writing to"
+            echo "your home folder fails. Driver sources: \`winfsp-*-source.tar.gz\`, \`dokan-*-source.tar.gz\`."
+            echo "What each file is: [docs/PACKAGES.md](https://github.com/${{ github.repository }}/blob/${{ steps.v.outputs.tag }}/docs/PACKAGES.md). Checksums: \`SHA256SUMS\`."
           } >>notes.md
           cat notes.md
 
