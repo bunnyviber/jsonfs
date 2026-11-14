@@ -6,8 +6,10 @@
 #
 # options:
 #   --test             run the native test-suite first
-#   --bundle-drivers   embed the WinFsp MSI and the Dokan 0.6.0 installer in the
-#                      Windows setup programs (downloaded into third_party/)
+#   --bundle-drivers   additionally build Windows setup programs that embed the
+#                      WinFsp 2.0 MSI and the Dokan 0.6.0 installer (downloaded
+#                      into third_party/drivers and checked against pinned
+#                      SHA-256 sums), plus the drivers' source archives
 #   --jobs N           parallel make jobs (default: number of CPUs)
 #
 # Outputs (dist/):
@@ -15,7 +17,10 @@
 #   jsonfs-VER-<os>-<arch>.run             self-extracting installer/uninstaller
 #   jsonfs-VER-windows-<arch>.zip          portable Windows binaries
 #   jsonfs-VER-windows-<arch>-setup.exe    NSIS installer/uninstaller (needs makensis)
+#   jsonfs-VER-windows-<arch>-setup-with-drivers.exe   same, with WinFsp/Dokan inside (--bundle-drivers)
+#   winfsp-2.0-source.tar.gz, dokan-0.6.0-source.tar.gz  sources of the bundled drivers (--bundle-drivers)
 #   SHA256SUMS
+# docs/PACKAGES.md describes every file.
 #
 # Toolchains: zig (>= 0.15) for Linux/macOS/FreeBSD/Windows-ARM64, MinGW-w64
 # for Windows x86/x64 (XP compatible), makensis for the Windows installers.
@@ -73,16 +78,39 @@ if [ ! -f third_party/winfsp/inc/fuse/fuse.h ]; then
     sh scripts/fetch-deps.sh winfsp || echo "warning: building Windows drivers without the WinFsp backend"
 fi
 
+# Driver packages embedded in the "-with-drivers" Windows installers.  The
+# versions are pinned and verified: a changed upstream file aborts the build.
+WINFSP_URL="https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
+WINFSP_SHA256="6324dc81194a6a08f97b6aeca303cf5c2325c53ede153bae9fc4378f0838c101"
+WINFSP_SRC="https://github.com/winfsp/winfsp/archive/refs/tags/v2.0.tar.gz"
+DOKAN_URL="https://github.com/dokan-dev/dokany/releases/download/0.6.0/DokanInstall_0.6.0.exe"
+DOKAN_SHA256="a92ebb9f5baa83aa33a186d329eed2a2d063448432584f5bd88fd53bd44c0b3b"
+DOKAN_SRC="https://github.com/dokan-dev/dokany/archive/refs/tags/0.6.0.tar.gz"
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+fetch_pinned() { # url sha256 dest
+    if [ ! -f "$3" ] || [ "$(sha256_of "$3")" != "$2" ]; then
+        curl -fsSL --retry 3 -o "$3.part" "$1"
+        mv "$3.part" "$3"
+    fi
+    if [ "$(sha256_of "$3")" != "$2" ]; then
+        echo "error: $3 does not match the pinned SHA-256 ($2)" >&2
+        exit 1
+    fi
+}
+
 WINFSP_MSI=""
 DOKAN_EXE=""
 if [ "$BUNDLE" = 1 ]; then
+    log "fetching driver installers"
     mkdir -p third_party/drivers
-    WINFSP_MSI="$ROOT/third_party/drivers/winfsp.msi"
+    WINFSP_MSI="$ROOT/third_party/drivers/winfsp-2.0.23075.msi"
     DOKAN_EXE="$ROOT/third_party/drivers/DokanInstall_0.6.0.exe"
-    [ -f "$WINFSP_MSI" ] || curl -fsSL -o "$WINFSP_MSI" \
-        "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi"
-    [ -f "$DOKAN_EXE" ] || curl -fsSL -o "$DOKAN_EXE" \
-        "https://github.com/dokan-dev/dokany/releases/download/0.6.0/DokanInstall_0.6.0.exe"
+    fetch_pinned "$WINFSP_URL" "$WINFSP_SHA256" "$WINFSP_MSI"
+    fetch_pinned "$DOKAN_URL" "$DOKAN_SHA256" "$DOKAN_EXE"
 fi
 
 if [ "$TEST" = 1 ]; then
@@ -108,19 +136,25 @@ for t in $TARGETS; do
     name="jsonfs-$VERSION-$t"
     st="$DIST/stage/$name"
     mkdir -p "$st/bin" "$st/docs"
-    cp README.md LICENSE "$st/"
-    cp docs/FORMAT.md docs/USAGE.md docs/BUILDING.md "$st/docs/"
+    cp README.md LICENSE THIRD_PARTY_NOTICES.md "$st/"
+    cp docs/FORMAT.md docs/USAGE.md docs/BUILDING.md docs/PACKAGES.md "$st/docs/"
     case "$t" in
     windows-*)
         cp "build/$t/bin/jsonfs.exe" "build/$t/bin/jsonfs-mount.exe" "$st/bin/"
         zipdir "$st" "$DIST/$name.zip"
         if command -v makensis >/dev/null 2>&1; then
             arch=${t#windows-}
-            set -- -V2 -DVERSION="$VERSION" -DARCH="$arch" -DBINDIR="$ROOT/build/$t/bin" -DSRCROOT="$ROOT" \
-                -DOUTFILE="$DIST/$name-setup.exe"
-            [ -n "$WINFSP_MSI" ] && set -- "$@" -DWINFSP_MSI="$WINFSP_MSI"
-            [ -n "$DOKAN_EXE" ] && [ "$arch" != arm64 ] && set -- "$@" -DDOKAN_EXE="$DOKAN_EXE"
-            makensis "$@" installer/windows/jsonfs.nsi
+            # without drivers: the installer points to the driver download pages
+            makensis -V2 -DVERSION="$VERSION" -DARCH="$arch" -DBINDIR="$ROOT/build/$t/bin" -DSRCROOT="$ROOT" \
+                -DOUTFILE="$DIST/$name-setup.exe" installer/windows/jsonfs.nsi
+            if [ "$BUNDLE" = 1 ]; then
+                # with drivers: WinFsp (Windows 7+, all architectures) and
+                # Dokan 0.6 (XP/Vista, x86/x64 only) are installed when missing
+                set -- -V2 -DVERSION="$VERSION" -DARCH="$arch" -DBINDIR="$ROOT/build/$t/bin" -DSRCROOT="$ROOT" \
+                    -DOUTFILE="$DIST/$name-setup-with-drivers.exe" -DWINFSP_MSI="$WINFSP_MSI"
+                [ "$arch" != arm64 ] && set -- "$@" -DDOKAN_EXE="$DOKAN_EXE"
+                makensis "$@" installer/windows/jsonfs.nsi
+            fi
         else
             echo "warning: makensis not found, skipping $name-setup.exe"
         fi
@@ -137,6 +171,17 @@ for t in $TARGETS; do
     esac
 done
 rm -rf "$DIST/stage"
+
+if [ "$BUNDLE" = 1 ]; then
+    # Corresponding source of the redistributed drivers (Dokan is LGPL; WinFsp
+    # is GPLv3 with a FLOSS exception) published next to the installers.
+    log "driver source archives"
+    if ! curl -fsSL --retry 3 -o "$DIST/winfsp-2.0-source.tar.gz" "$WINFSP_SRC" ||
+        ! curl -fsSL --retry 3 -o "$DIST/dokan-0.6.0-source.tar.gz" "$DOKAN_SRC"; then
+        echo "error: cannot download the driver sources (needed when redistributing the drivers)" >&2
+        exit 1
+    fi
+fi
 
 log "checksums"
 (cd "$DIST" && if command -v sha256sum >/dev/null 2>&1; then sha256sum -- *; else shasum -a 256 -- *; fi) >"$DIST/SHA256SUMS.tmp"

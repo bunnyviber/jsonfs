@@ -240,8 +240,71 @@ and `fsck -t jsonfs` work on Linux.
 * Linux / macOS / FreeBSD: `sudo sh jsonfs-VER-OS-ARCH.run` (install),
   `sudo sh jsonfs-VER-OS-ARCH.run uninstall` or `sudo jsonfs-uninstall`.
   `--prefix DIR` installs elsewhere (e.g. `--prefix $HOME/.local`, no root).
-* Windows: run `jsonfs-VER-windows-ARCH-setup.exe`; uninstall from
-  *Add/Remove Programs* or the Start-menu entry. Silent: `/S`.
+* Windows: run `jsonfs-VER-windows-ARCH-setup-with-drivers.exe` (installs
+  WinFsp / Dokan when missing) or `jsonfs-VER-windows-ARCH-setup.exe` (no
+  drivers); uninstall from *Add/Remove Programs* or the Start-menu entry.
+  Silent: `/S`. [PACKAGES.md](PACKAGES.md) describes every release file.
 
 Kernel side: libfuse 2 or 3 (Linux), macFUSE or FUSE-T (macOS), fusefs +
 fusefs-libs (FreeBSD), WinFsp (Windows 7–11), Dokan 0.6.0 (Windows XP/Vista).
+
+### macOS: code signing
+
+**When you need it.** You need it if `jsonfs` or `jsonfs-mount` fails with
+`Operation not permitted` while working with files in protected folders, but
+the same command works in `/tmp`. Your home folder, Desktop, Documents,
+Downloads and iCloud Drive are protected folders. For example:
+
+```
+$ jsonfs mkfs ~/test.json
+jsonfs: ~/test.json: Operation not permitted
+```
+
+You don't need it if everything works. You also don't need it on Linux,
+FreeBSD or Windows, or just for mounting.
+
+**Why.** macOS privacy protection (TCC) decides per program which folders it
+may touch. It recognizes a program by its code signature.
+
+- **The release builds:** JSONfs releases carry no Apple Developer ID
+  signature, because that costs a yearly Apple membership. The Apple silicon
+  build only has the minimal "ad-hoc" signature the linker adds, and the Intel
+  build has none.
+- **What macOS does with such a program:** it gives it no stable identity. The
+  usual "allow access?" prompt never appears, and the program is refused
+  instead.
+- **What signing changes:** signing it yourself gives it a stable identity
+  that you can grant access to once. Reinstalling with the same certificate
+  keeps that grant.
+
+**How (one time, free).**
+
+1. Create a certificate.
+   - Open *Keychain Access* and choose *Keychain Access › Certificate
+     Assistant › Create a Certificate…*.
+   - Name: `JSONfs Local`. Identity Type: *Self Signed Root*. Certificate
+     Type: *Code Signing*. Click *Create*.
+2. Trust the certificate.
+   - Find the certificate in the *login* keychain and open it.
+   - Under *Trust*, set *Code Signing* to *Always Trust*.
+3. Install with signing:
+
+   ```sh
+   sudo sh jsonfs-VER-macos-arm64.run install --codesign "JSONfs Local"
+   ```
+
+   The installer signs both programs as your user, because the certificate is
+   in your keychain, not root's. It needs the Xcode command line tools
+   (`xcode-select --install`).
+4. Grant access.
+   - Open *System Settings › Privacy & Security › Full Disk Access*.
+   - Click *+*, press <kbd>⌘⇧G</kbd>, enter `/usr/local/bin` and add `jsonfs`
+     and `jsonfs-mount`.
+   - Alternatively, grant access to your terminal app instead. Programs started
+     from it inherit its permissions.
+
+**Updates.** The identity is saved in
+`/usr/local/share/jsonfs/codesign-identity`. Later installs re-sign
+automatically. Use `--no-codesign` to install unsigned. A self-signed
+certificate only works on the Mac that created it. Builds that run anywhere
+without these steps would need an Apple Developer ID and notarization.

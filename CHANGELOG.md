@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.1 (2026-11-14)
+
+**Windows installers, two flavors:**
+- `*-setup-with-drivers.exe` bundles the unmodified WinFsp 2.0 (Windows 7+)
+  and Dokan 0.6.0 (XP/Vista, x86/x64) installers, and installs the driver
+  when it is missing.
+- `*-setup.exe` has no drivers and links to their download pages, as before.
+- The driver source archives are attached to the release, and
+  `THIRD_PARTY_NOTICES.md` covers their licenses.
+
+**macOS code signing:** the `.run` installer has a new
+`--codesign IDENTITY` option. It signs `jsonfs` and `jsonfs-mount` with a
+certificate from your keychain (a free self-signed one works), so that macOS
+privacy protection can be granted access to them. This fixes "Operation not
+permitted" in the home folder. Updates re-sign automatically.
+See docs/USAGE.md, "macOS: code signing".
+
+`docs/PACKAGES.md` describes every release file.
+
 ## 1.3.0 (2026-11-13)
 
 **Archive conversion.** `jsonfs convert`, `from-archive`, `to-archive` and `archive-formats` turn archives into JSONfs images and back.

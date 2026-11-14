@@ -2,6 +2,7 @@
 # JSONfs installer / uninstaller for Linux, macOS and FreeBSD.
 #
 #   install.sh [install] [--prefix DIR] [--from BINDIR] [--no-mount-helper] [--yes]
+#              [--codesign IDENTITY | --no-codesign]     (macOS, see below)
 #   install.sh uninstall [--prefix DIR]
 #   install.sh status    [--prefix DIR]
 #
@@ -18,6 +19,16 @@
 #   PREFIX/share/doc/jsonfs/*         documentation
 #   PREFIX/share/jsonfs/manifest      list of installed files (used to uninstall)
 #
+# macOS code signing (--codesign IDENTITY):
+#   The release builds carry no developer signature, and macOS privacy
+#   protection can refuse them access to some folders (for example creating
+#   files directly in your home folder fails with "Operation not permitted").
+#   --codesign signs both programs with a code-signing certificate from your
+#   keychain (a free self-signed one is enough, see docs/USAGE.md) so that
+#   macOS sees a stable identity you can grant access to once.  The identity
+#   is remembered: later installs/updates re-sign automatically unless
+#   --no-codesign is given.
+#
 # The kernel side is provided by the operating system's FUSE implementation:
 #   Linux   libfuse 3 or 2 (package fuse3 / fuse)
 #   macOS   macFUSE (https://osxfuse.github.io) or FUSE-T (https://www.fuse-t.org)
@@ -29,6 +40,8 @@ PREFIX=/usr/local
 FROM=
 HELPER=1
 YES=0
+CODESIGN=
+NO_CODESIGN=0
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 while [ $# -gt 0 ]; do
@@ -40,8 +53,11 @@ while [ $# -gt 0 ]; do
     --from=*) FROM=${1#--from=} ;;
     --no-mount-helper) HELPER=0 ;;
     -y | --yes) YES=1 ;;
+    --codesign) CODESIGN=${2:-}; shift ;;
+    --codesign=*) CODESIGN=${1#--codesign=} ;;
+    --no-codesign) NO_CODESIGN=1 ;;
     -h | --help)
-        sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -51,6 +67,7 @@ done
 
 OS=$(uname -s)
 MANIFEST="$PREFIX/share/jsonfs/manifest"
+SIGN_FILE="$PREFIX/share/jsonfs/codesign-identity"
 say() { printf '%s\n' "$*"; }
 need_root() {
     if [ ! -w "$PREFIX" ] && [ "$(id -u)" -ne 0 ]; then
@@ -115,6 +132,50 @@ check_fuse() {
     esac
 }
 
+# Runs a command as the user who invoked sudo (their keychain holds the
+# signing certificate), or directly when not running under sudo.
+as_user() {
+    if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+        sudo -u "$SUDO_USER" "$@"
+    else
+        "$@"
+    fi
+}
+
+# Signs copies of the binaries; sets BIN_SRC to the signed copies.
+codesign_binaries() {
+    if [ "$OS" != Darwin ]; then
+        say "error: --codesign is only meaningful on macOS" >&2
+        exit 2
+    fi
+    if ! command -v codesign >/dev/null 2>&1; then
+        say "error: codesign not found (install the Xcode command line tools: xcode-select --install)" >&2
+        exit 1
+    fi
+    if ! as_user security find-identity -p codesigning 2>/dev/null | grep -qF "\"$CODESIGN\""; then
+        say "error: no code-signing identity named \"$CODESIGN\" in your keychain." >&2
+        say "  Create one in Keychain Access > Certificate Assistant > Create a Certificate..." >&2
+        say "  (Identity Type: Self Signed Root, Certificate Type: Code Signing), then set it to" >&2
+        say "  \"Always Trust\" for Code Signing. Details: docs/USAGE.md, \"macOS: code signing\"." >&2
+        exit 1
+    fi
+    SIGN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/jsonfs-sign.XXXXXX")
+    cp "$BIN_SRC/jsonfs" "$BIN_SRC/jsonfs-mount" "$SIGN_DIR/"
+    if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+        chown -R "$SUDO_USER" "$SIGN_DIR"
+    fi
+    for b in jsonfs jsonfs-mount; do
+        if ! as_user codesign --force --sign "$CODESIGN" --identifier "org.jsonfs.$b" "$SIGN_DIR/$b"; then
+            say "error: signing $b with \"$CODESIGN\" failed (is the certificate trusted for code signing?)" >&2
+            rm -rf "$SIGN_DIR"
+            exit 1
+        fi
+        as_user codesign --verify --strict "$SIGN_DIR/$b"
+    done
+    BIN_SRC=$SIGN_DIR
+    say "signed jsonfs and jsonfs-mount with \"$CODESIGN\""
+}
+
 do_install() {
     find_bins
     if ! "$BIN_SRC/jsonfs" version >/dev/null 2>&1; then
@@ -122,6 +183,14 @@ do_install() {
         exit 1
     fi
     need_root
+    # reuse the signing identity of the previous installation (updates)
+    if [ -z "$CODESIGN" ] && [ "$NO_CODESIGN" = 0 ] && [ -f "$SIGN_FILE" ]; then
+        CODESIGN=$(cat "$SIGN_FILE")
+        say "re-signing with the identity used before: $CODESIGN (--no-codesign to skip)"
+    fi
+    [ "$NO_CODESIGN" = 1 ] && CODESIGN=
+    SIGN_DIR=
+    [ -n "$CODESIGN" ] && codesign_binaries
     if [ -f "$MANIFEST" ]; then
         say "removing previous installation first"
         do_uninstall quiet
@@ -140,7 +209,7 @@ do_install() {
             say "note: not root, skipping /sbin/mount.jsonfs (mount -t jsonfs / fstab support)"
         fi
     fi
-    for doc in README.md LICENSE docs/FORMAT.md docs/BUILDING.md docs/USAGE.md; do
+    for doc in README.md LICENSE THIRD_PARTY_NOTICES.md docs/FORMAT.md docs/BUILDING.md docs/USAGE.md docs/PACKAGES.md; do
         for base in "$HERE" "$HERE/../.."; do
             if [ -f "$base/$doc" ]; then
                 put "$base/$doc" "$PREFIX/share/doc/jsonfs/$(basename "$doc")" 644
@@ -157,6 +226,11 @@ exec sh "$PREFIX/share/jsonfs/install.sh" uninstall --prefix "$PREFIX" "\$@"
 EOF
     chmod 755 "$PREFIX/bin/jsonfs-uninstall"
     record "$PREFIX/bin/jsonfs-uninstall"
+    if [ -n "$CODESIGN" ]; then
+        printf '%s\n' "$CODESIGN" >"$SIGN_FILE"
+        record "$SIGN_FILE"
+    fi
+    [ -n "$SIGN_DIR" ] && rm -rf "$SIGN_DIR"
     record "$MANIFEST"
     mv "$MANIFEST.new" "$MANIFEST"
     say "JSONfs $("$PREFIX/bin/jsonfs" version | awk '{print $2}') installed into $PREFIX"

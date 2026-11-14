@@ -4,6 +4,7 @@
 ;   makensis -DVERSION=1.0.0 -DARCH=x64 -DBINDIR=build/windows-x64/bin \
 ;            -DSRCROOT=. -DOUTFILE=dist/jsonfs-1.0.0-windows-x64-setup.exe \
 ;            [-DWINFSP_MSI=path\to\winfsp.msi] [-DDOKAN_EXE=path\to\DokanInstall_0.6.0.exe] \
+;            (with the driver defines: the "-setup-with-drivers.exe" variant, see docs/PACKAGES.md)
 ;            installer/windows/jsonfs.nsi
 ;
 ; The installer copies jsonfs.exe (toolkit) and jsonfs-mount.exe (driver
@@ -43,7 +44,12 @@ Unicode true
 !define WINFSP_URL "https://winfsp.dev/rel/"
 !define DOKAN_URL "https://github.com/dokan-dev/dokany/releases/tag/0.6.0"
 
-Name "${PRODUCT} ${VERSION} (${ARCH})"
+!ifdef WINFSP_MSI
+  !define FLAVOR " with drivers"
+!else
+  !define FLAVOR ""
+!endif
+Name "${PRODUCT} ${VERSION} (${ARCH})${FLAVOR}"
 OutFile "${OUTFILE}"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
@@ -131,10 +137,12 @@ Section "JSONfs toolkit and mount driver (required)" SecMain
   File "${BINDIR}\jsonfs-mount.exe"
   File /oname=README.txt "${SRCROOT}\README.md"
   File /oname=LICENSE.txt "${SRCROOT}\LICENSE"
+  File /oname=THIRD_PARTY_NOTICES.txt "${SRCROOT}\THIRD_PARTY_NOTICES.md"
   SetOutPath "$INSTDIR\docs"
   File "${SRCROOT}\docs\FORMAT.md"
   File "${SRCROOT}\docs\USAGE.md"
   File "${SRCROOT}\docs\BUILDING.md"
+  File "${SRCROOT}\docs\PACKAGES.md"
   SetOutPath "$INSTDIR"
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -168,7 +176,11 @@ Section "Add to the system PATH" SecPath
   WriteRegDWORD HKLM "Software\JSONfs" "AddedToPath" 1
 SectionEnd
 
-Section "Check / install the filesystem driver (WinFsp or Dokan)" SecDriver
+!ifdef WINFSP_MSI
+Section "Install the filesystem driver if missing (WinFsp / Dokan included)" SecDriver
+!else
+Section "Check for the filesystem driver (WinFsp or Dokan)" SecDriver
+!endif
   Call DetectDriver
   ${If} $DRIVER != ""
     DetailPrint "Filesystem driver found: $DRIVER"
@@ -202,7 +214,11 @@ SectionEnd
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecMain} "jsonfs.exe (mkfs, fsck, snapshot, versioning, recompress, upgrade, import/export) and jsonfs-mount.exe."
   !insertmacro MUI_DESCRIPTION_TEXT ${SecPath} "Lets you run jsonfs and jsonfs-mount from any command prompt."
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecDriver} "WinFsp (Windows 7+) or Dokan 0.6.0 (XP/Vista) provides the kernel side of the mount."
+!ifdef WINFSP_MSI
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecDriver} "Installs the bundled WinFsp 2.0 (Windows 7+) or Dokan 0.6.0 (XP/Vista) unless a driver is already present."
+!else
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecDriver} "WinFsp (Windows 7+) or Dokan 0.6.0 (XP/Vista) provides the kernel side of the mount; offers the download page when missing."
+!endif
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 Section "Uninstall"
@@ -215,6 +231,8 @@ Section "Uninstall"
   Delete "$INSTDIR\jsonfs-mount.exe"
   Delete "$INSTDIR\README.txt"
   Delete "$INSTDIR\LICENSE.txt"
+  Delete "$INSTDIR\THIRD_PARTY_NOTICES.txt"
+  Delete "$INSTDIR\docs\PACKAGES.md"
   Delete "$INSTDIR\docs\FORMAT.md"
   Delete "$INSTDIR\docs\USAGE.md"
   Delete "$INSTDIR\docs\BUILDING.md"
